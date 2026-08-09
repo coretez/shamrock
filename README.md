@@ -20,6 +20,10 @@ Built with Electron. Everything stays local on your Mac: API keys are encrypted 
 - **Context compression** — summarizes older history as it approaches a model's context window, structurally protecting discovered values.
 - **In-place updates** — a titlebar chip announces new commits; one click pulls, refreshes dependencies, and restarts (git installs today; signed release channel on the roadmap).
 
+## Download
+
+Dev-preview builds for macOS are on the [releases page](https://github.com/coretez/shamrock/releases/latest) — `arm64` for Apple Silicon, plain `.dmg` for Intel. **The builds are unsigned for now** (signed + notarized installers are on the roadmap): on first launch, right-click the app and choose Open. Or clone and `npm start`.
+
 ## Status & roadmap
 
 Shamrock is a **public dev preview** — clone and run. It is built spec-first:
