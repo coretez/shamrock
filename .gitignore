@@ -1,0 +1,17 @@
+node_modules/
+dist/
+out/
+.DS_Store
+*.log
+.env
+.env.*
+
+# Local, machine-specific Claude Code settings (permissions etc.)
+.claude/settings.local.json
+
+# Generated test/preview artifact (built by scripts/mkpreview or /tmp harness)
+src/renderer/preview.html
+
+# Local build output + OS cruft
+build/*.iconset/
+*.icns.tmp

@@ -1,0 +1,48 @@
+{
+  "name": "agnostic-chat",
+  "version": "0.1.0",
+  "description": "Shamrock \u2014 an LLM-agnostic desktop harness for coding, documents, and agentic work. Local-first, spec-driven.",
+  "main": "src/main/main.js",
+  "author": "Christopher Jordan",
+  "license": "SEE LICENSE IN LICENSE",
+  "scripts": {
+    "start": "electron .",
+    "dev": "electron . --dev",
+    "icon": "electron scripts/make-icon.js",
+    "pack": "electron-builder --mac --dir",
+    "dist": "electron-builder --mac"
+  },
+  "build": {
+    "appId": "com.fluencysecurity.agnosticchat",
+    "productName": "Shamrock",
+    "copyright": "Copyright \u00a9 2026 Christopher Jordan",
+    "directories": {
+      "buildResources": "build",
+      "output": "dist"
+    },
+    "files": [
+      "src/**/*",
+      "package.json",
+      "!src/renderer/preview.html"
+    ],
+    "mac": {
+      "category": "public.app-category.developer-tools",
+      "icon": "build/icon.icns",
+      "target": [
+        "dmg"
+      ],
+      "identity": null
+    },
+    "dmg": {
+      "title": "${productName} ${version}"
+    }
+  },
+  "devDependencies": {
+    "electron": "^43.2.0",
+    "electron-builder": "^26.15.3"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/coretez/shamrock.git"
+  }
+}
