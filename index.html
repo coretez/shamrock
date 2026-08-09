@@ -344,5 +344,18 @@ class Component extends DCLogic {
   }
 }
 </script>
+<script>
+(function () {
+  var kick = function () {
+    document.querySelectorAll('video[autoplay]').forEach(function (v) {
+      v.muted = true;                       // property, not just attribute
+      if (v.paused) v.play().catch(function () {});
+    });
+  };
+  document.addEventListener('DOMContentLoaded', kick);
+  [400, 1200, 3000, 6000].forEach(function (t) { setTimeout(kick, t); });
+  document.addEventListener('click', kick, { once: true });   // last resort: first interaction
+})();
+</script>
 </body>
 </html>
