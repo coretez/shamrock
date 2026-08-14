@@ -20,8 +20,8 @@ contextBridge.exposeInMainWorld('api', {
 
   /** Answer a mid-turn "tool-call limit reached" prompt: more>0 grants that many
    *  more tool iterations; 0 stops and forces a final wrap-up. */
-  continueChat: (more) => ipcRenderer.send('chat:continue', { more }),
-  abortChat: () => ipcRenderer.send('chat:abort'),
+  continueChat: (more, turnId) => ipcRenderer.send('chat:continue', { more, turnId }),
+  abortChat: (turnId) => ipcRenderer.send('chat:abort', { turnId }),
 
   /** Open an https link in the user's default browser. */
   openExternal: (url) => ipcRenderer.invoke('app:openExternal', url),
@@ -38,6 +38,19 @@ contextBridge.exposeInMainWorld('api', {
     const h = (_e, data) => cb(data);
     ipcRenderer.on('skills:progress', h);
     return () => ipcRenderer.removeListener('skills:progress', h);
+  },
+
+  /** Librarian (O31): filing events + tag vocabulary + batch tidy. */
+  onLibrarianUpdate: (cb) => {
+    const h = (_e, data) => cb(data);
+    ipcRenderer.on('librarian:update', h);
+    return () => ipcRenderer.removeListener('librarian:update', h);
+  },
+  library: {
+    tags: (projectId) => ipcRenderer.invoke('library:tags', { projectId }),
+    tidy: (input) => ipcRenderer.invoke('library:tidy', input),
+    untagDocument: (documentId, tagId) => ipcRenderer.invoke('library:untagDocument', { documentId, tagId }),
+    untagChat: (chatId, tagId) => ipcRenderer.invoke('library:untagChat', { chatId, tagId })
   },
 
   update: {
@@ -59,7 +72,9 @@ contextBridge.exposeInMainWorld('api', {
     setCheatSheet: (id, text) => ipcRenderer.invoke('projects:setCheatSheet', { id, text }),
     pickOutputDir: (id) => ipcRenderer.invoke('projects:pickOutputDir', { id }),
     setOutputDir: (id, dir) => ipcRenderer.invoke('projects:setOutputDir', { id, dir }),
-    effectiveOutputDir: (id) => ipcRenderer.invoke('projects:effectiveOutputDir', { id })
+    effectiveOutputDir: (id) => ipcRenderer.invoke('projects:effectiveOutputDir', { id }),
+    // O30: user-invoked drift scan — findings land in the DEBT ledger.
+    drift: (input) => ipcRenderer.invoke('project:drift', input)
   },
 
   // Authored per-project sub-agent definitions.
@@ -112,6 +127,7 @@ contextBridge.exposeInMainWorld('api', {
     remove: (id) => ipcRenderer.invoke('documents:remove', { id }),
     ensureCanonical: (projectId) => ipcRenderer.invoke('documents:ensureCanonical', { projectId }),
     read: (id) => ipcRenderer.invoke('documents:read', { id }),
+    openPdf: (id) => ipcRenderer.invoke('documents:openPdf', { id }),
     saveUpload: (input) => ipcRenderer.invoke('documents:saveUpload', input),
     toPdf: (id) => ipcRenderer.invoke('documents:toPdf', { id }),
     listFormats: (projectId) => ipcRenderer.invoke('documents:listFormats', { projectId }),

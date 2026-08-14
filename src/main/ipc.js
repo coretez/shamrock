@@ -11,15 +11,31 @@ const { executePlan, executeStep, synthesize } = require('./execute');
 const { reviewChanges } = require('./review');
 const { derivePlan, refinePlan } = require('./plan-derive');
 const { VariableStore, SET_VARIABLE_TOOL } = require('./variables');
-const { enrichSkillRow, parseFrontmatter } = require('./skill-content');
+const { enrichSkillRow, parseFrontmatter, skillPreconditions } = require('./skill-content');
 const { runSubagent, mergeResults, DEFAULT_AGENT, DELEGATE_TOOL, ASSIGN_TOOL } = require('./subagent');
 const { runEvaluator } = require('./evaluator');
 const { selectContext, applyToolCeiling } = require('./context-select');
-const { buildCodingTools, buildLibraryTools, hasGit, initGit, commitStep } = require('./coding-tools');
+const { buildCodingTools, buildLibraryTools, hasGit, initGit, commitStep, runCheckCommand, didMutate, MUTATING_TOOLS, WRITING_TOOLS } = require('./coding-tools');
+const { driftScan } = require('./drift');
 const projectDocs = require('./project-docs');
 const { updateDocs } = require('./doc-writer');
 const webTools = require('./web-tools');
 const projectFacts = require('./project-facts');
+const librarian = require('./librarian');
+
+// Cost-outlier detection (O14): a turn is flagged when it costs this many
+// times the project's recent median input tokens. Needs MIN_HISTORY prior
+// measured turns before it says anything, so a new project stays quiet.
+const COST_OUTLIER_FACTOR = 3;
+const MIN_COST_HISTORY = 5;
+
+/** Median of a numeric list, or 0 when there is not enough history to judge. */
+function medianOf(values) {
+  const v = values.filter((n) => Number.isFinite(n) && n > 0).sort((a, b) => a - b);
+  if (v.length < MIN_COST_HISTORY) return 0;
+  const mid = Math.floor(v.length / 2);
+  return v.length % 2 ? v[mid] : Math.round((v[mid - 1] + v[mid]) / 2);
+}
 
 // O7: render the alignment outcome — the reply IS the open decisions. Plain
 // markdown the renderer already knows how to display.
@@ -232,7 +248,76 @@ function parseSkillVersions(text) {
   return out;
 }
 
-function registerIpc() {
+// ── Documents-surface path containment ──────────────────────────────────────
+// Renderer-supplied and DB-indexed paths may only be read/revealed/rendered
+// when they lie inside a root the app legitimately manages: the global
+// documents base, or a project's output_dir / working_dir. Without this,
+// documents:create + documents:read was a two-call arbitrary file read
+// (~/.ssh, the DB itself). realpath-based so a symlinked index entry cannot
+// point outside; prefix-checked with a trailing separator (no /project vs
+// /project-evil confusion).
+function documentsRoots() {
+  const roots = [];
+  try { roots.push(repo.settings.get('documents_base') || docs.defaultBase()); } catch { roots.push(docs.defaultBase()); }
+  try {
+    for (const p of repo.projects.list({ includeArchived: true }) || []) {
+      if (p.output_dir) roots.push(p.output_dir);
+      if (p.working_dir) roots.push(p.working_dir);
+    }
+  } catch {}
+  return roots;
+}
+function realOrNull(p) {
+  const fs = require('node:fs');
+  try { return fs.realpathSync(p); } catch { return null; }
+}
+// realpath the deepest EXISTING ancestor and re-append the untraversed tail
+// (same rationale as coding-tools.realResolve) — a not-yet-written file under
+// /var on macOS must still resolve through the /var→/private/var symlink so
+// the prefix check compares real against real.
+function realResolveLoose(p) {
+  const path = require('node:path');
+  let cur = path.resolve(String(p));
+  const tail = [];
+  for (;;) {
+    const real = realOrNull(cur);
+    if (real) return tail.length ? path.join(real, ...tail) : real;
+    const parent = path.dirname(cur);
+    if (parent === cur) return path.resolve(String(p));
+    tail.unshift(path.basename(cur));
+    cur = parent;
+  }
+}
+function documentPathAllowed(p) {
+  if (!p) return false;
+  const path = require('node:path');
+  const target = realResolveLoose(p);
+  return documentsRoots().some((r) => {
+    const rr = realOrNull(r);
+    if (!rr) return false;
+    return target === rr || target.startsWith(rr + path.sep);
+  });
+}
+
+// ── Librarian vocabulary (O31) ──────────────────────────────────────────────
+// What the project already calls things — existing tags, doc types, entities —
+// so filing PREFERS the established vocabulary instead of coining near-
+// duplicates. Cheap queries; rebuilt per filing call.
+function buildVocabulary(projectId) {
+  const v = { tags: [], docTypes: [], entities: [] };
+  if (!projectId) return v;
+  try { v.tags = repo.tags.listByProject(projectId); } catch {}
+  try {
+    for (const d of repo.documents.listByProject(projectId)) {
+      if (d.doc_type) v.docTypes.push(d.doc_type);
+      const ent = d.properties && (d.properties.tenant || d.properties.company);
+      if (ent) v.entities.push(String(ent));
+    }
+  } catch {}
+  return v;
+}
+
+function registerIpc() { // (documentPathAllowed exported below for smoke coverage)
   // Projects
   ipcMain.handle('projects:list', (_e, opts) => repo.projects.list(opts));
   ipcMain.handle('projects:create', (_e, input) => repo.projects.create(input));
@@ -251,7 +336,14 @@ function registerIpc() {
     if (res.canceled || !res.filePaths.length) return { ok: false };
     return { ok: true, project: repo.projects.setWorkingDir(id, res.filePaths[0]) };
   });
-  ipcMain.handle('app:revealPath', (_e, p) => { if (p) shell.openPath(p); });
+  // Reveal is jailed to the documents surface — shell.openPath can launch
+  // executables via the OS default handler, so an arbitrary path is an
+  // execution primitive, not a convenience.
+  ipcMain.handle('app:revealPath', (_e, p) => {
+    if (!p || !documentPathAllowed(p)) return { ok: false, error: 'path outside the documents library / project directories' };
+    shell.openPath(String(p));
+    return { ok: true };
+  });
   // In-place update (git-checkout mode today; release channel when packaged).
   ipcMain.handle('update:check', async () => {
     try { return await require('./updater').checkForUpdate(); }
@@ -323,10 +415,59 @@ function registerIpc() {
     if (!d) return { error: 'Document not found.' };
     try {
       const fs = require('node:fs');
-      if (d.path && fs.existsSync(d.path)) return { content: fs.readFileSync(d.path, 'utf8'), mime: d.mime_type || 'text/plain', title: d.title };
+      if (d.path && fs.existsSync(d.path)) {
+        // Jail check at READ time — an index row (whatever wrote it) must not
+        // become a read primitive for arbitrary files the app can see.
+        if (!documentPathAllowed(d.path)) return { error: 'Document path is outside the documents library / project directories.' };
+        // A PDF read as utf8 is mojibake — the viewer was showing `%PDF-1.4`
+        // and a screenful of replacement characters. Hand the renderer the
+        // BYTES so it can let Chromium render the document as a document.
+        const isPdf = /pdf/i.test(d.mime_type || '') || /\.pdf$/i.test(d.path);
+        if (isPdf) {
+          // Hand back the PATH, not the bytes. Chromium refuses a top-level
+          // navigation to a data:application/pdf URL (ERR_FAILED — measured),
+          // which is what drew the black rectangle. A file: URL renders the
+          // document properly. The path is jail-checked directly above, so the
+          // renderer only ever receives one inside the allowed roots.
+          return { pdfPath: d.path, mime: 'application/pdf', title: d.title, bytes: fs.statSync(d.path).size };
+        }
+        // Other binaries (spreadsheets, images, archives) have no in-app
+        // viewer yet. Say what they are rather than rendering their bytes.
+        if (/\.(xlsx?|docx?|pptx?|png|jpe?g|gif|zip|bin)$/i.test(d.path)) {
+          return { binary: true, mime: d.mime_type || 'application/octet-stream', title: d.title, path: d.path, bytes: fs.statSync(d.path).size };
+        }
+        return { content: fs.readFileSync(d.path, 'utf8'), mime: d.mime_type || 'text/plain', title: d.title };
+      }
       return { content: d.content || '', mime: d.mime_type || 'text/plain', title: d.title };
     } catch (e) { return { error: e.message }; }
   });
+  // Open a PDF in its own hardened window. Measured 2026-08-14: the artifact
+  // <webview> cannot render PDFs (a captured frame held 9 distinct colours —
+  // blank), a data:application/pdf URL is refused outright by Chromium
+  // (ERR_FAILED), and setting webPreferences.plugins BREAKS the load rather
+  // than enabling it. A top-level BrowserWindow on a file: URL renders the
+  // document properly (1693 distinct colours in the same measurement), which
+  // is what this does. Path is re-jailed here — the renderer passes an id,
+  // never a path, so this can never be aimed at an arbitrary file.
+  ipcMain.handle('documents:openPdf', (_e, { id }) => {
+    const d = repo.documents.get(id);
+    if (!d || !d.path) return { error: 'Document not found.' };
+    if (!documentPathAllowed(d.path)) return { error: 'Document path is outside the allowed directories.' };
+    try {
+      const fsx = require('node:fs');
+      if (!fsx.existsSync(d.path)) return { error: 'File is missing on disk.' };
+      const w = new BrowserWindow({
+        width: 900, height: 1100, title: d.title || 'Document',
+        webPreferences: { sandbox: true, contextIsolation: true, nodeIntegration: false }
+      });
+      // A document window shows a document: no app navigation, no popups.
+      w.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
+      w.webContents.on('will-navigate', (ev) => ev.preventDefault());
+      w.loadURL('file://' + encodeURI(d.path));
+      return { ok: true };
+    } catch (e) { return { error: e.message }; }
+  });
+
   // Bootstrap the canonical dev-doc set (docs/SPEC.md, DESIGN.md, PSEUDOCODE.md,
   // KNOWLEDGE.md) — idempotent; the renderer calls this when a project opens so
   // the DOCUMENTS tab always shows the project's documentation structure.
@@ -353,7 +494,35 @@ function registerIpc() {
 
   // Settings (small key/value store; project_id null = global)
   ipcMain.handle('settings:get', (_e, { key, projectId = null }) => repo.settings.get(key, projectId));
-  ipcMain.handle('settings:set', (_e, { key, value, projectId = null }) => repo.settings.set(key, value, projectId));
+  ipcMain.handle('settings:set', async (_e, { key, value, projectId = null }) => {
+    // Enabling the standing bypass is a main-side decision, not a renderer
+    // message — a compromised renderer must not be able to silently grant
+    // itself unprompted writes (the ipc surface is the second wall).
+    if (key === 'coding_bypass' && String(value) === '1') {
+      const win = BrowserWindow.getFocusedWindow() || BrowserWindow.getAllWindows()[0];
+      const r = await dialog.showMessageBox(win, {
+        type: 'warning', buttons: ['Enable bypass', 'Cancel'], defaultId: 1, cancelId: 1,
+        message: 'Run shell commands without asking, for this project?',
+        detail: 'File writes already flow without prompts (git rolls them back). This bypass additionally lets SHELL COMMANDS run unprompted — and shell effects (network calls, installs, deletes outside the repo) are NOT undone by git. The BYPASS chip stays visible; click it to revoke.'
+      });
+      if (r.response !== 0) return { ok: false, cancelled: true };
+    }
+    // O26 rides the SAME second wall as the bypass: the check command is a
+    // renderer-supplied string that main later executes as shell WITHOUT an
+    // approval gate (standing consent). That consent must be granted
+    // main-side, showing the verbatim command (O5) — a compromised renderer
+    // must never be able to install its own unprompted execution.
+    if (key === 'check_command' && String(value || '').trim()) {
+      const win = BrowserWindow.getFocusedWindow() || BrowserWindow.getAllWindows()[0];
+      const r = await dialog.showMessageBox(win, {
+        type: 'warning', buttons: ['Set check command', 'Cancel'], defaultId: 1, cancelId: 1,
+        message: 'Run this command automatically for this project?',
+        detail: `${String(value).trim()}\n\nThe app will run this WITHOUT asking — at the start of every coding turn and after every change it makes. Only set a command you would run yourself (tests, lint, build).`
+      });
+      if (r.response !== 0) return { ok: false, cancelled: true };
+    }
+    return repo.settings.set(key, value, projectId);
+  });
 
   // Meta-evaluator — critique a turn's context engineering with a chosen model.
   ipcMain.handle('evaluate:run', async (_e, { providerId, model, digest }) => {
@@ -370,8 +539,45 @@ function registerIpc() {
     }
   });
 
+  // O30: the drift pass — backward-looking garbage collection, user-invoked
+  // from the Overview MAINTENANCE card. Read-only scan of recent source files
+  // against the rulebook (O29) + canonical docs (O15); findings land in the
+  // DEBT ledger (O27). Fixes are NOT applied here — the user runs them as
+  // ordinary turns with ordinary gates.
+  ipcMain.handle('project:drift', async (_e, { projectId, providerId, model }) => {
+    const provider = repo.providers.get(providerId);
+    if (!provider || !provider.enabled) return { error: 'No enabled model connection for the drift scan.', findings: [] };
+    const key = repo.providers.reveal(providerId);
+    if (!key) return { error: `No API key stored for ${provider.label || provider.type}.`, findings: [] };
+    const project = repo.projects.get(projectId);
+    if (!project || !project.working_dir) return { error: 'The project needs a working directory to scan.', findings: [] };
+    try {
+      const outputDir = resolveProjectOutputDir(projectId);
+      const docsBase = project.working_dir;
+      // Read-only pack: the scan uses list_dir/read_file only, so the gate
+      // callback can refuse everything without ever being consulted.
+      const coding = buildCodingTools({ root: project.working_dir, docsRoot: outputDir, approveAction: async () => false, projectId });
+      const rb = projectDocs.readRulebook(project.working_dir);
+      const connector = getConnector(provider, key);
+      const scan = await driftScan({
+        connector, model: model || provider.default_model, coding, root: project.working_dir,
+        rulebook: rb ? rb.text : '', docsBlock: projectDocs.load(projectId, 4000)
+      });
+      let debt = { added: 0, repeats: 0 };
+      if (scan.findings.length) debt = projectDocs.appendDebt({ projectId, docsBase, findings: scan.findings.map((f) => ({ ...f, status: 'drift scan' })) });
+      return { findings: scan.findings, scanned: scan.scanned, added: debt.added, repeats: debt.repeats, error: scan.error };
+    } catch (e) {
+      return { error: e && e.message ? e.message : 'drift scan failed', findings: [] };
+    }
+  });
+
   // Chats & messages
-  ipcMain.handle('chats:list', (_e, { projectId }) => repo.chats.listByProject(projectId));
+  ipcMain.handle('chats:list', (_e, { projectId }) => {
+    const rows = repo.chats.listByProject(projectId);
+    let byChat = {};
+    try { byChat = repo.tags.forProjectChats(projectId); } catch {}
+    return rows.map((c) => ({ ...c, tags: byChat[c.id] || [] }));
+  });
   ipcMain.handle('chats:create', (_e, input) => repo.chats.create(input));
   ipcMain.handle('chats:rename', (_e, { id, title }) => repo.chats.rename(id, title));
   ipcMain.handle('chats:setModel', (_e, { id, model }) => repo.chats.setModel(id, model));
@@ -434,6 +640,7 @@ function registerIpc() {
   ipcMain.handle('documents:toPdf', async (_e, { id }) => {
     const row = repo.documents.get(id);
     if (!row || !row.path) throw new Error(`no document with id ${id}`);
+    if (!documentPathAllowed(row.path)) throw new Error('document path is outside the documents library / project directories');
     const { htmlToPdf } = require('./render-pdf');
     const out = await htmlToPdf(row.path);
     let indexed = null;
@@ -446,9 +653,65 @@ function registerIpc() {
     } catch (e) { console.error('[toPdf index]', e && e.message); }
     return { pdfPath: out.pdfPath, bytes: out.bytes, id: indexed && indexed.id };
   });
-  ipcMain.handle('documents:list', (_e, { projectId }) => repo.documents.listByProject(projectId));
-  ipcMain.handle('documents:create', (_e, input) => repo.documents.create(input));
+  ipcMain.handle('documents:list', (_e, { projectId }) => {
+    const rows = repo.documents.listByProject(projectId);
+    let byDoc = {};
+    try { byDoc = repo.tags.forProjectDocuments(projectId); } catch {}
+    return rows.map((d) => ({ ...d, tags: byDoc[d.id] || [] }));
+  });
+  ipcMain.handle('documents:create', (_e, input) => {
+    if (input && input.path && !documentPathAllowed(input.path)) {
+      throw new Error('document path must be inside the documents library or a project directory');
+    }
+    return repo.documents.create(input);
+  });
   ipcMain.handle('documents:linkToChat', (_e, input) => repo.documents.linkToChat(input));
+
+  // ── Librarian surface (O31) ───────────────────────────────────────────────
+  ipcMain.handle('library:tags', (_e, { projectId }) => repo.tags.listByProject(projectId));
+  ipcMain.handle('library:untagDocument', (_e, { documentId, tagId }) => { repo.tags.untagDocument(documentId, tagId); return { ok: true }; });
+  ipcMain.handle('library:untagChat', (_e, { chatId, tagId }) => { repo.tags.untagChat(chatId, tagId); return { ok: true }; });
+  // Batch tidy: file untagged documents and unfiled sessions (bounded per
+  // run). Tags/summaries only — nothing moves on disk, everything reversible,
+  // provenance recorded — so it applies directly and reports what it did.
+  ipcMain.handle('library:tidy', async (_e, { projectId, providerId, model }) => {
+    const provider = providerId ? repo.providers.get(providerId) : null;
+    const key = provider ? repo.providers.reveal(providerId) : null;
+    if (!provider || !key) return { ok: false, error: 'no provider available for the librarian' };
+    const connector = getConnector(provider, key);
+    const fm = provider.fast_model || model || provider.default_model;
+    const filedDocs = []; const filedChats = [];
+    try {
+      const tagged = repo.tags.forProjectDocuments(projectId);
+      const docsToFile = repo.documents.listByProject(projectId).filter((d) => !(tagged[d.id] || []).length).slice(0, 15);
+      for (const d of docsToFile) {
+        let head = String(d.content || '').slice(0, 2000);
+        try { if (!head && d.path && documentPathAllowed(d.path)) head = require('node:fs').readFileSync(d.path, 'utf8').slice(0, 2000); } catch {}
+        const filed = await librarian.fileDocument({
+          connector, model: fm,
+          meta: { title: d.title, type: d.doc_type, properties: d.properties || {} },
+          contentHead: head, vocabulary: buildVocabulary(projectId)
+        });
+        for (const t of filed.tags) { const tag = repo.tags.ensure(projectId, t.facet, t.name); if (tag) repo.tags.tagDocument(d.id, tag.id); }
+        if (filed.tags.length) filedDocs.push({ id: d.id, title: d.title, tags: filed.tags.length });
+      }
+      const chatTagged = repo.tags.forProjectChats(projectId);
+      const chatsToFile = repo.chats.listByProject(projectId).filter((c) => !c.summary || !(chatTagged[c.id] || []).length).slice(0, 10);
+      for (const c of chatsToFile) {
+        const filed = await librarian.fileSession({
+          connector, model: fm, messages: repo.messages.listByChat(c.id),
+          currentTitle: c.title || '', vocabulary: buildVocabulary(projectId)
+        });
+        if (filed.summary) repo.chats.setSummary(c.id, filed.summary);
+        if (filed.title && !c.title) repo.chats.rename(c.id, filed.title);
+        for (const t of filed.tags) { const tag = repo.tags.ensure(projectId, t.facet, t.name); if (tag) repo.tags.tagChat(c.id, tag.id); }
+        if (filed.summary || filed.tags.length) filedChats.push({ id: c.id, tags: filed.tags.length });
+      }
+      return { ok: true, documents: filedDocs.length, chats: filedChats.length };
+    } catch (e) {
+      return { ok: false, error: e.message, documents: filedDocs.length, chats: filedChats.length };
+    }
+  });
   ipcMain.handle('documents:listByChat', (_e, { chatId }) => repo.documents.listByChat(chatId));
 
   // Skills + per-project scoping
@@ -562,8 +825,34 @@ function registerIpc() {
 
   // MCP servers — metadata only out; env/token stay in main.
   ipcMain.handle('mcp:list', () => repo.mcp.list());
-  ipcMain.handle('mcp:add', (_e, input) => repo.mcp.add(input));
-  ipcMain.handle('mcp:update', (_e, { id, patch }) => repo.mcp.update(id, patch));
+  // A stdio MCP server is an arbitrary command this app will spawn — that
+  // decision is confirmed in MAIN, not taken on a renderer message alone
+  // (mcp:add + mcp:connect was renderer-to-RCE with no second wall).
+  const confirmMcpCommand = async (command, args) => {
+    if (!command) return true; // http transport — no spawn
+    const win = BrowserWindow.getFocusedWindow() || BrowserWindow.getAllWindows()[0];
+    const r = await dialog.showMessageBox(win, {
+      type: 'warning', buttons: ['Allow', 'Cancel'], defaultId: 1, cancelId: 1,
+      message: 'Allow this MCP server command?',
+      detail: `The app will run:\n\n${command} ${(args || []).join(' ')}\n\nOnly allow commands you recognize.`
+    });
+    return r.response === 0;
+  };
+  ipcMain.handle('mcp:add', async (_e, input) => {
+    if (!(await confirmMcpCommand(input && input.command, input && input.args))) return { ok: false, cancelled: true };
+    return repo.mcp.add(input);
+  });
+  ipcMain.handle('mcp:update', async (_e, { id, patch }) => {
+    // Re-confirm only when the spawned command actually changes.
+    if (patch && (patch.command !== undefined || patch.args !== undefined)) {
+      const cur = repo.mcp.get(id) || {};
+      const nextCmd = patch.command !== undefined ? patch.command : cur.command;
+      const nextArgs = patch.args !== undefined ? patch.args : (cur.args || []);
+      const changed = nextCmd !== cur.command || JSON.stringify(nextArgs) !== JSON.stringify(cur.args || []);
+      if (changed && !(await confirmMcpCommand(nextCmd, nextArgs))) return { ok: false, cancelled: true };
+    }
+    return repo.mcp.update(id, patch);
+  });
   ipcMain.handle('mcp:remove', (_e, { id }) => repo.mcp.remove(id));
   // Per-project MCP scoping (opt-out, mirrors skills:enabledForProject)
   ipcMain.handle('mcp:enabledForProject', (_e, { projectId }) => repo.mcp.listEnabledForProject(projectId));
@@ -675,7 +964,13 @@ function registerIpc() {
       const connector = getConnector(provider, key);
       const chosenModel = model || provider.default_model;
       const fastModel = provider.fast_model || chosenModel;
-      const emitProgress = (ev) => { try { _e.sender.send('chat:progress', ev); } catch {} };
+      // Turn identity: every progress event carries this id, and the control
+      // channels (chat:abort / chat:continue) only act when the id matches —
+      // with two turns in flight, an approval or STOP meant for one can never
+      // resolve against the other. The renderer mints the id so it can filter
+      // events into the right submit closure from the very first event.
+      const turnId = (payload && payload.turnId) ? String(payload.turnId) : `t${Date.now().toString(36)}${Math.floor(Math.random() * 1e6).toString(36)}`;
+      const emitProgress = (ev) => { try { _e.sender.send('chat:progress', { turnId, ...ev }); } catch {} };
       const turnStart = Date.now();
       const chatId = payload?.chatId || null;
       const taskLog = []; // per-task timing/tokens (sub-agents; tools added post-loop)
@@ -686,10 +981,19 @@ function registerIpc() {
       // step results, tool trace, and metrics are all still persisted.
       let aborted = false;
       const turnAbort = new AbortController();
-      const abortListener = () => { aborted = true; try { turnAbort.abort(); } catch {} emitProgress({ type: 'process', kind: 'abort' }); };
-      ipcMain.once('chat:abort', abortListener);
+      const abortListener = (_ev, p) => {
+        if (p && p.turnId && p.turnId !== turnId) return; // someone else's turn
+        aborted = true; try { turnAbort.abort(); } catch {} emitProgress({ type: 'process', kind: 'abort' });
+      };
+      ipcMain.on('chat:abort', abortListener);
       const isAborted = () => aborted;
-      const chatAbortable = (a) => connector.chat({ ...a, signal: turnAbort.signal });
+      const chatAbortable = (a) => connector.chat({
+        ...a,
+        signal: turnAbort.signal,
+        // Connector-level retry (429/overload/transient 5xx) surfaces in the
+        // glass box instead of looking like a silent stall.
+        onRetry: (r) => emitProgress({ type: 'process', kind: 'retry', attempt: r.attempt, status: r.status, delayMs: r.delayMs })
+      });
 
       // One-shot user prompts (limit / stuck / action-approve): emit an event,
       // await the reply on chat:continue. Waiters are a FIFO queue — parallel
@@ -697,7 +1001,10 @@ function registerIpc() {
       // would resolve the wrong waiter (the loser hanging to its timeout).
       // No reply in 180s, or a STOP, resolves 0.
       const promptWaiters = [];
-      const promptListener = (_ev, payload) => { const w = promptWaiters.shift(); if (w) w(Number(payload && payload.more) || 0); };
+      const promptListener = (_ev, payload) => {
+        if (payload && payload.turnId && payload.turnId !== turnId) return; // another turn's reply
+        const w = promptWaiters.shift(); if (w) w(Number(payload && payload.more) || 0);
+      };
       ipcMain.on('chat:continue', promptListener);
       const askUser = (event) => new Promise((resolve) => {
         let done = false;
@@ -918,8 +1225,13 @@ function registerIpc() {
             // so writes flow freely when git exists. Shell can do things git
             // cannot undo, so it still asks. No git → everything asks.
             if (kind === 'write' && gitNow()) return true;
-            // Level-3 bypass (covers shell too): only honored with git — even
-            // if the setting was somehow set without it, we still ask.
+            // Level-3 bypass. In practice this is a SHELL bypass — writes are
+            // already free with git — and git does NOT roll back shell effects
+            // (network calls, installs, deletes outside the tree). The honest
+            // framing lives where the setting is granted: the main-process
+            // confirmation dialog (settings:set) states exactly that risk, so
+            // the standing grant is an informed one and cannot be flipped by a
+            // renderer message alone.
             try { if (gitNow() && repo.settings.get('coding_bypass', projectId) === '1') return true; } catch {}
             return (await askUser({ type: 'action-approve', kind, summary, gitAvailable: gitNow() })) > 0;
           };
@@ -936,6 +1248,18 @@ function registerIpc() {
           coding = buildCodingTools({ root: project.working_dir, docsRoot: outputDir, approveAction, buildEnv, projectId });
           coding.root = project.working_dir;         // for step-commits (O9)
           coding.gitAvailable = gitAvailable;
+          coding.buildEnv = buildEnv;
+          // O29: the repo speaks first — the working-dir rulebook rides into
+          // the CODING MODE note (execution) and Pass 2 (planning). Missing
+          // rulebook = silent passthrough; found = a visible ledger event.
+          const rb = projectDocs.readRulebook(project.working_dir);
+          coding.rulebook = rb ? rb.text : '';
+          if (rb) emitProgress({ type: 'process', kind: 'rulebook', path: rb.relPath, chars: rb.text.length });
+          // O26: the framework check gate. The BASELINE runs lazily — just
+          // before this turn's first mutation (see ensureBaseline) — so a
+          // question-only turn never pays for a slow test suite, while
+          // pre-existing breakage is still attributed rather than inherited.
+          coding.checkCommand = String(repo.settings.get('check_command', projectId) || '').trim();
           // Web tools join the planning menu in coding mode — docs lookup and
           // error-message searches are part of real development.
           scopedTools = [...scopedTools, ...coding.tools, ...webTools.WEB_TOOLS];
@@ -950,26 +1274,76 @@ function registerIpc() {
               + 'If an action is declined, continue without it. Read a file before editing it; edit_file replaces an exact '
               + 'existing string. run_command executes in the working directory and is KILLED when it '
               + 'returns — start long-running processes (dev servers, watchers) with start_server, which '
-              + 'keeps them alive across turns; read their output with server_logs.'
+              + 'keeps them alive across turns; read their output with server_logs. '
+              // O28: test integrity is a standing rule at execution time, not
+              // just plan-shape guidance — the flat loop writes code too.
+              + 'NEVER delete, skip, or weaken a failing test to make it pass — fix the root cause; '
+              + 'if a test itself is wrong, say so explicitly when changing it.'
               + (Object.keys(buildEnv).length ? ' Build environment variables set for this project: ' + Object.keys(buildEnv).join(', ') + '.' : '')
+              + (coding.checkCommand
+                ? `\n\nPROJECT CHECK: the framework runs \`${coding.checkCommand}\` after your changes and it must pass. A failure comes back to you with its output; fix the root cause.`
+                : '')
+              + (coding.rulebook
+                ? '\n\nPROJECT RULEBOOK (' + rb.relPath + ' — non-negotiable rules for all work in this repository):\n' + String(coding.rulebook).slice(0, 6000)
+                : '')
               + (() => { const l = projectId ? projectDocs.listLibrary(projectId) : ''; return l ? '\n\nPROJECT LIBRARY — documents and uploaded files already saved for this project. Read them at these exact paths; do not ask the user to locate them:\n' + l : ''; })()
           }, ...convo];
-          emitProgress({ type: 'process', kind: 'coding-mode', root: project.working_dir, docsRoot: outputDir, tools: coding.tools.length, gitAvailable });
+          emitProgress({ type: 'process', kind: 'coding-mode', root: project.working_dir, docsRoot: outputDir, tools: coding.tools.length, gitAvailable, rulebook: !!rb, check: !!coding.checkCommand });
         } else {
           console.warn('[coding-mode] chat has coding mode on but the project has no working_dir — tools not offered');
         }
       }
 
+      // ── O26: the check gate's turn-scoped state ─────────────────────────
+      // One closure owns every check run this turn — each is a process event,
+      // and the LAST verdict is what synthesis, review, and the debt ledger
+      // see. Defined here (not inside the execution branch) so the tool
+      // wrapper below can trigger the lazy baseline.
+      const checkState = { ran: false, failing: false, output: '', baselineFailing: false };
+      const runTurnCheck = async (phase, step) => {
+        if (!coding || !coding.checkCommand) return null;
+        emitProgress({ type: 'process', kind: 'check', phase, step: step && step.id, command: coding.checkCommand });
+        const c = await runCheckCommand(coding.root, coding.checkCommand, coding.buildEnv);
+        checkState.ran = true; checkState.failing = !c.ok; checkState.output = c.output;
+        emitProgress({ type: 'process', kind: c.ok ? 'check-pass' : 'check-failed', phase });
+        // Attribution: a check that was ALREADY failing before this turn
+        // touched anything is not this turn's doing — say so where the model
+        // reads it, so it fixes the root cause without owning old breakage.
+        if (!c.ok && checkState.baselineFailing) {
+          c.output = 'NOTE: this check was ALREADY FAILING before this turn made any change — the pre-existing failures are not yours.\n' + c.output;
+        }
+        return c;
+      };
+      // The baseline runs ONCE, lazily, immediately before the turn's first
+      // mutation: a question-only turn never pays for a slow suite, and the
+      // attribution property is preserved because nothing has changed yet.
+      let baselineDone = false;
+      const ensureBaseline = async () => {
+        if (baselineDone || !coding || !coding.checkCommand) return;
+        baselineDone = true;
+        emitProgress({ type: 'process', kind: 'check', phase: 'baseline', command: coding.checkCommand });
+        const c = await runCheckCommand(coding.root, coding.checkCommand, coding.buildEnv);
+        checkState.baselineFailing = !c.ok;
+        emitProgress({ type: 'process', kind: c.ok ? 'check-pass' : 'check-failed', phase: 'baseline' });
+      };
+
       // Orchestrator gets the MCP tools PLUS `delegate`; sub-agents get the MCP
       // tools only (no `delegate`) so the tree stays one level deep. Coding
       // tools (no `__` namespace) route to the pack; everything else to MCP.
-      const rawCallTool = (name, args) => (coding && coding.names.has(name))
-        ? coding.call(name, args)
-        : (library && library.names.has(name))
-          ? library.call(name, args)
-          : webTools.names.has(name)
-            ? webTools.call(name, args)
-            : mcpManager.callTool(name, args, toolset.routes);
+      // Sub-agents share this router, so their mutations trigger the baseline
+      // too — the third path is not exempt from attribution.
+      const rawCallTool = async (name, args) => {
+        if (coding && coding.checkCommand && MUTATING_TOOLS.includes(name)) {
+          try { await ensureBaseline(); } catch (e) { console.error('[check baseline]', e && e.message); }
+        }
+        return (coding && coding.names.has(name))
+          ? coding.call(name, args)
+          : (library && library.names.has(name))
+            ? library.call(name, args)
+            : webTools.names.has(name)
+              ? webTools.call(name, args)
+              : mcpManager.callTool(name, args, toolset.routes);
+      };
 
       // Authored per-project agents the orchestrator can delegate to by name.
       let authoredAgents = [];
@@ -986,7 +1360,7 @@ function registerIpc() {
       // Document placement template (user-configurable; global default).
       // `project`/`outputDir` were resolved above (coding-mode block).
       const placementTemplate = repo.settings.get('placement_template') || docs.DEFAULT_TEMPLATE;
-      const saveDocument = (args) => {
+      const saveDocument = async (args) => {
         // Canonical dev docs (spec/design/pseudocode/knowledge) have a fixed,
         // designed home at docs/<NAME>.md — a documentation step's save goes
         // there and versions, never into the deliverables bin.
@@ -1010,12 +1384,35 @@ function registerIpc() {
             return { text: `save_document (spreadsheet): content must be JSON {sheets:[{name, rows:[[…]]}]} — ${e.message}`, isError: true };
           }
         }
-        const meta = { type: args.type, title: args.title, format: saveFormat, properties: args.properties || {} };
+        // O31: librarian filing BEFORE placement — one fast-model call
+        // normalizes type/entity/period against the project's existing
+        // vocabulary and proposes faceted tags; deterministic validation
+        // (librarian.js) decides what lands. The LLM chooses meaning, the
+        // template still chooses location; a filing failure saves unfiled.
+        const meta = { type: args.type, title: args.title, format: saveFormat, properties: { ...(args.properties || {}) } };
+        let filed = { tags: [] };
+        if (projectId && !isAborted()) {
+          filed = await librarian.fileDocument({
+            connector: { chat: chatAbortable }, model: fastModel,
+            meta: { title: args.title, type: args.type, properties: args.properties || {} },
+            contentHead: String(args.content || '').slice(0, 2000),
+            vocabulary: buildVocabulary(projectId)
+          });
+          if (filed.docType) meta.type = filed.docType;
+          if (filed.entity && !meta.properties.tenant && !meta.properties.company) meta.properties.tenant = filed.entity;
+          if (filed.period && !meta.properties.period && !meta.properties.date) meta.properties.period = filed.period;
+        }
         const w = docs.writeDocument({ outputDir, template: placementTemplate, meta, content: saveContent });
         let row = null;
         try {
-          row = repo.documents.saveGenerated({ projectId, title: args.title || w.relPath, path: w.absPath, mimeType: w.mime, source: 'chat', docType: args.type || null, version: w.version, properties: args.properties || null });
+          row = repo.documents.saveGenerated({ projectId, title: args.title || w.relPath, path: w.absPath, mimeType: w.mime, source: 'chat', docType: meta.type || null, version: w.version, properties: Object.keys(meta.properties).length ? meta.properties : null });
         } catch (e) { console.error('[save_document index]', e && e.message); }
+        if (row && filed.tags.length) {
+          try {
+            for (const t of filed.tags) { const tag = repo.tags.ensure(projectId, t.facet, t.name); if (tag) repo.tags.tagDocument(row.id, tag.id); }
+            emitProgress({ type: 'process', kind: 'librarian-filed', target: 'document', title: args.title, docType: meta.type || null, tags: filed.tags.map((t) => `${t.facet}:${t.name}`) });
+          } catch (e) { console.error('[librarian tags]', e && e.message); }
+        }
         emitProgress({ type: 'document-saved', id: row && row.id, title: args.title, path: w.absPath, relPath: w.relPath, version: w.version, mime: w.mime });
         return { text: `Saved "${args.title}" → ${w.relPath} (v${w.version}) in the document library. Full path: ${w.absPath}` };
       };
@@ -1055,7 +1452,7 @@ function registerIpc() {
           return { text: entry ? `Remembered ${entry.key} = ${JSON.stringify(entry.value)}` : 'Ignored (empty key or value).' };
         }
         if (name === 'save_document') {
-          try { return saveDocument(args || {}); }
+          try { return await saveDocument(args || {}); }
           catch (e) { console.error('[save_document]', e && e.message); return { text: `save_document failed: ${e.message}`, isError: true }; }
         }
         if (name === 'delegate') {
@@ -1101,7 +1498,7 @@ function registerIpc() {
       // what is occupying the window this turn (occupancy, compaction, prompt).
       try {
         const tokensBefore = estimateTokens(base);
-        _e.sender.send('chat:progress', buildLedger({ convo, tools: orchestratorTools, model: chosenModel, compressed, tokensBefore, skillSelect, toolScope }));
+        _e.sender.send('chat:progress', { turnId, ...buildLedger({ convo, tools: orchestratorTools, model: chosenModel, compressed, tokensBefore, skillSelect, toolScope }) });
       } catch (e) { console.error('[internals ledger]', e && e.message); }
 
       // Interactive continuation: when the loop hits its tool-call budget, ask
@@ -1156,14 +1553,14 @@ function registerIpc() {
             }
           } catch (e) { console.error('[doc-writer]', e && e.message); }
         };
-        const turnMutated = (trace) => (trace || []).some((t) => t.ok !== false && ['write_file', 'edit_file', 'run_command'].includes(t.name));
+        const turnMutated = didMutate;   // shared definition (coding-tools.js)
         // The files a trace actually changed, with content — evidence for the
         // review pass AND the doc-writer (documenting from step summaries
         // alone produced vague docs; real contents produce real module maps).
         const readChanged = async (trace) => {
           if (!coding) return [];
           const paths = [...new Set((trace || [])
-            .filter((t) => t.ok !== false && ['write_file', 'edit_file'].includes(t.name))
+            .filter((t) => t.ok !== false && WRITING_TOOLS.includes(t.name))
             .map((t) => (t.args && t.args.path) || '').filter(Boolean))].slice(0, 6);
           const files = [];
           for (const p of paths) {
@@ -1172,7 +1569,35 @@ function registerIpc() {
           }
           return files;
         };
-        if (scopedTools.length || loadedSkills.length) {
+        // ── PRECONDITION GATE: a selected skill with none of its declared
+        // tools reachable cannot do its job. Proceeding is not a degraded run,
+        // it is a fabricated one — measured 2026-08-14, a dead Fluency
+        // connector (401, zero of nine tools resolving) still produced a
+        // formatted, filed, versioned monthly security report that was
+        // invented end to end. Deterministic: no model call, no judgement,
+        // just "you named tools that do not exist here". Partial resolution is
+        // allowed; zero is the cliff.
+        const unmetSkills = loadedSkills
+          .map((s) => ({ name: s.name, ...skillPreconditions(s, toolset.tools.map((t) => t.name)) }))
+          .filter((p) => p.unmet);
+        if (unmetSkills.length) {
+          emitProgress({ type: 'process', kind: 'precondition-unmet', skills: unmetSkills.map((s) => ({ skill: s.name, declared: s.declared.length, missing: s.missing })) });
+          // Expressed as an O7 ALIGN outcome rather than a bespoke error: an
+          // unreachable data source IS a decision the user has to make, and
+          // align already ends the turn cleanly, renders a form, and records
+          // nothing. Synthetic — built here without a model call.
+          plan = {
+            simple: true, align: true, goal: '', steps: [], record: [], droppedRecords: [],
+            decisions: unmetSkills.map((s) => ({
+              question: `"${s.name}" needs ${s.declared.length} tool${s.declared.length === 1 ? '' : 's'} that this project cannot reach right now (${s.missing.slice(0, 4).join(', ')}${s.missing.length > 4 ? `, +${s.missing.length - 4} more` : ''}). How should I proceed?`,
+              options: [
+                'Reconnect the connector, then ask me again — the connector is probably disconnected or its authorization expired',
+                'Proceed anyway without live data — any figures would be unsourced'
+              ],
+              recommendation: 'Reconnect first. A report assembled without its sources looks finished and is fiction, which is worse than no report.'
+            }))
+          };
+        } else if (scopedTools.length || loadedSkills.length) {
           // Visible + bounded: planning on a thinking fast-model can take
           // minutes — narrate it (the rail/status shows "deriving plan…"
           // instead of silent bouncing balls), and cap it so a stalled
@@ -1180,7 +1605,7 @@ function registerIpc() {
           emitProgress({ type: 'process', kind: 'planning', model: fastModel });
           const planT0 = Date.now();
           plan = await Promise.race([
-            derivePlan({ connector: { chat: chatAbortable }, model: fastModel, userText: plannerText, cheatSheet: project && project.cheat_sheet, loadedSkills, tools: scopedTools, store, agents: authoredAgents, codingMode: !!coding, documentsMode: !!library, projectDocs: docsBlock, repoMap, formatTarget, branding, rawData }),
+            derivePlan({ connector: { chat: chatAbortable }, model: fastModel, userText: plannerText, cheatSheet: project && project.cheat_sheet, loadedSkills, tools: scopedTools, store, agents: authoredAgents, codingMode: !!coding, documentsMode: !!library, projectDocs: docsBlock, repoMap, rulebook: coding ? coding.rulebook : '', formatTarget, branding, rawData }),
             new Promise((resolve) => setTimeout(() => resolve({ simple: true, goal: '', steps: [], error: 'planning timed out (240s) — fell back to the flat loop' }), 240000))
           ]);
           if (plan.error) console.warn('[plan-derive]', plan.error);
@@ -1192,10 +1617,33 @@ function registerIpc() {
         // outrank model guesses and survive turns/restarts with the store.
         // O15: the same decisions land in the project SPEC as dated decision
         // records — deterministic bookkeeping, the doc twin of step-commits.
+        // O8 + O14: report the DENOMINATOR, not just the rejections. A
+        // dropped-only event made silence ambiguous — "nothing was proposed"
+        // and "everything proposed was valid" looked identical, so a guard
+        // that never ran was indistinguishable from one working perfectly.
+        // This fires whenever the planner offered anything, so no event now
+        // means exactly one thing: it offered nothing.
+        const kept = (plan && Array.isArray(plan.record)) ? plan.record.length : 0;
+        const dropped = (plan && Array.isArray(plan.droppedRecords)) ? plan.droppedRecords : [];
+        if (kept + dropped.length > 0) {
+          emitProgress({
+            type: 'process', kind: 'records', proposed: kept + dropped.length,
+            kept, dropped, reason: dropped.length ? 'not durable direction decisions' : ''
+          });
+        }
+        // True only when this turn is the user answering the align form.
+        const ratified = !!(payload && payload.fromAlign);
         if (plan && Array.isArray(plan.record) && plan.record.length) {
           for (const rec of plan.record) {
-            const e = store.set({ key: rec.key, value: rec.value }, { confidence: 'user', source: 'align' });
-            if (e) emitProgress({ type: 'process', kind: 'var-set', key: e.key });
+            // O8 tiering: `user` is the top, overwrite-protected tier and it
+            // means THE HUMAN SAID THIS. Only a turn that answers the align
+            // form qualifies (the renderer sets fromAlign on exactly that
+            // turn). Everything else here is the planner's INFERENCE that a
+            // direction was stated, so it lands at `derived` and stays
+            // correctable — a wrong inference at `user` was permanent.
+            const e = store.set({ key: rec.key, value: rec.value },
+              ratified ? { confidence: 'user', source: 'align' } : { confidence: 'derived', source: 'plan-record' });
+            if (e) emitProgress({ type: 'process', kind: 'var-set', key: e.key, confidence: e.confidence });
             // Chat ↔ Overview parity: DOCUMENT TARGETS stated in chat land in
             // the SAME per-project settings the Overview form shows. Format
             // values resolve against the library's formats/ files by name.
@@ -1245,7 +1693,7 @@ function registerIpc() {
         } else if (plan && !plan.simple && plan.steps.length > 1) {
           // ── Plan-and-execute path ─────────────────────────────────────────
           emitProgress({ type: 'process', kind: 'plan', goal: plan.goal, merge: plan.merge || '', orchestrator: plan.orchestrator || null, steps: plan.steps.map((s) => ({ id: s.id, task: s.task, produces: s.produces || '', parallel: s.parallel, group: s.group || '' })) });
-          const planDeps = { connector: { chat: chatAbortable }, model: fastModel, userText: plannerText, cheatSheet: project && project.cheat_sheet, loadedSkills, tools: scopedTools, agents: authoredAgents, projectDocs: docsBlock, repoMap, formatTarget, branding, rawData };
+          const planDeps = { connector: { chat: chatAbortable }, model: fastModel, userText: plannerText, cheatSheet: project && project.cheat_sheet, loadedSkills, tools: scopedTools, agents: authoredAgents, projectDocs: docsBlock, repoMap, rulebook: coding ? coding.rulebook : '', formatTarget, branding, rawData };
 
           // Stuck escalation (decision #1): after the re-plan budget is spent,
           // explain what's stuck via the shared one-shot prompt queue.
@@ -1270,12 +1718,16 @@ function registerIpc() {
             // empty trace so sub-agent work is never mis-attributed.
             onStepComplete: async (step, stepResult, trace) => {
               if (!coding || !coding.gitAvailable) return;
-              const mutated = (trace || []).some((t) => t.ok !== false && (t.name === 'write_file' || t.name === 'edit_file' || t.name === 'run_command'));
-              if (!mutated) return;
+              if (!didMutate(trace)) return;
               const msg = `step ${step.id}: ${String(step.produces || step.task || '').slice(0, 150)}`;
               const out = await commitStep(coding.root, msg);
               if (out.committed) emitProgress({ type: 'process', kind: 'step-commit', step: step.id, message: msg });
             },
+            // O26: the framework check gate — runs after every mutating
+            // sequential step (execute.js inserts one bounded fix step on
+            // failure; fix steps only re-check, so it cannot spiral).
+            checkStep: (coding && coding.checkCommand) ? (step) => runTurnCheck('step', step) : undefined,
+            checkCommand: coding ? coding.checkCommand : '',
             // Between-steps compaction that structurally protects the KNOWN
             // VALUES digest (P3) — discovered parameters survive verbatim.
             compact: async (h) => {
@@ -1327,17 +1779,33 @@ function registerIpc() {
             onEvent: emitProgress
           });
 
+          // O26 third path: delegated/fan-out steps CAN mutate (sub-agents get
+          // the coding tools) but their traces stay isolated, so the per-step
+          // gate is blind to them. One final check covers whatever they did
+          // to the tree — the deterministic verdict needs no trace.
+          if (coding && coding.checkCommand && !exec.aborted && exec.stepResults.some((r) => r.parallel)) {
+            try { await runTurnCheck('post-parallel'); } catch (e) { console.error('[check parallel]', e && e.message); }
+          }
+
           // ── O11 verify layer 2+3: quality + security review of the changed
           // files (review.js), deterministic like step-commits. Layer 1 —
           // "it works" — is the plan's own verify step. Confirmed high/med
           // findings get ONE bounded fix step (worst first), then the fix is
           // committed; review can never spiral or break a turn.
+          // O27: whatever this cycle cannot verify as fixed lands in the DEBT
+          // ledger afterwards — nothing evaporates.
+          let turnFindings = [];
           if (coding && !exec.aborted && exec.completed && turnMutated(exec.toolTrace)) {
             try {
               const files = await readChanged(exec.toolTrace);
               if (files.length) {
                 emitProgress({ type: 'process', kind: 'review', files: files.length });
                 const rev = await reviewChanges({ connector: { chat: chatAbortable }, model: fastModel, files, goal: plan.goal });
+                // O26: a failing check at review time is the review's FIRST
+                // finding — deterministic, ahead of every model lens.
+                if (checkState.ran && checkState.failing) {
+                  rev.findings.unshift({ lens: 'check', severity: 'high', file: '(project)', issue: `the project check command (${coding.checkCommand}) is failing`, fix: 'make it pass by fixing the root cause — never by weakening tests' });
+                }
                 if (rev.findings.length && !isAborted()) {
                   emitProgress({ type: 'process', kind: 'review-findings', count: rev.findings.length });
                   const fixStep = {
@@ -1358,12 +1826,47 @@ function registerIpc() {
                     const c = await commitStep(project.working_dir, 'review: fix quality/security findings');
                     if (c && c.committed) emitProgress({ type: 'process', kind: 'step-commit', step: 'review' });
                   } catch {}
+                  // O26: the fix step's claim is verified by the check, not
+                  // taken on faith — this is the turn's final verdict.
+                  await runTurnCheck('post-fix');
                   emitProgress({ type: 'process', kind: 'review-fixed', count: rev.findings.length });
+                  turnFindings = rev.findings.map((f) => ({ ...f, status: 'fix attempted — unverified' }));
                 } else if (!rev.findings.length) {
                   emitProgress({ type: 'process', kind: 'review-clean' });
                 }
               }
             } catch (e) { console.error('[review]', e && e.message); }
+          }
+
+          // Plan attrition reaches the reply. A re-plan may legitimately drop
+          // steps, but the user should never be told a 4-step plan succeeded
+          // when 2 of its steps never ran — that is how a turn that produced
+          // nothing reported success.
+          if (exec.skipped && exec.skipped.length && !exec.aborted) {
+            exec.stepResults.push({
+              step: 'plan', task: 'planned steps that never ran',
+              conclusion: `Steps ${exec.skipped.join(', ')} were in the original plan and did not run (the plan was revised mid-turn). Say plainly what was not done.`,
+              incomplete: true
+            });
+          }
+
+          // O26: a check still failing after everything is an honest,
+          // visible outcome — it reaches synthesis as an incomplete step
+          // result, so the reply says what remains instead of claiming done.
+          if (checkState.ran && checkState.failing && !exec.aborted) {
+            exec.stepResults.push({ step: 'check', task: `project check (${coding.checkCommand})`, conclusion: 'FAILING at turn end:\n' + checkState.output, incomplete: true });
+            if (!turnFindings.some((f) => f.lens === 'check')) {
+              turnFindings.push({ lens: 'check', severity: 'high', file: '(project)', issue: `check command (${coding.checkCommand}) failing at turn end`, fix: 'fix the root cause', status: 'unresolved' });
+            }
+          }
+          // O27: the debt ledger — review findings and unresolved check
+          // failures are recorded durably; a repeat is flagged as a
+          // promote-to-gate candidate. Best-effort, never breaks the turn.
+          if (turnFindings.length && projectId) {
+            try {
+              const d = projectDocs.appendDebt({ projectId, docsBase, findings: turnFindings });
+              if (d.added) emitProgress({ type: 'process', kind: 'debt', added: d.added, repeats: d.repeats, version: d.version });
+            } catch (e) { console.error('[debt]', e && e.message); }
           }
 
           // The bubble has been streaming per-step text; the synthesis is the
@@ -1387,7 +1890,7 @@ function registerIpc() {
             u.cachedTokens += syn.usage.cachedTokens || 0; u.cacheCreationTokens += syn.usage.cacheCreationTokens || 0;
           }
           emitProgress({ type: 'done' });
-          result = { reply: syn.reply, toolTrace: exec.toolTrace, iterations: exec.stepResults.length, usage: u, planned: true, cappedTurn: !exec.completed, aborted: exec.aborted };
+          result = { reply: syn.reply, toolTrace: exec.toolTrace, iterations: exec.stepResults.length, usage: u, planned: true, cappedTurn: !exec.completed, aborted: exec.aborted, truncated: !!(exec.truncated || syn.truncated), checkFailing: !!(checkState.ran && checkState.failing && !exec.aborted), checkCommand: coding ? coding.checkCommand : '' };
           planInfo = { steps: plan.steps.length, replans: exec.replans, completed: exec.completed };
 
           // O15: documentation is maintained AUTOMATICALLY after execution —
@@ -1409,7 +1912,22 @@ function registerIpc() {
             tools: orchestratorTools,
             onEvent: emitProgress,
             onLimit,
-            isAborted
+            isAborted,
+            // In-loop ledger for the flat path — tool results accrete inside
+            // the loop; the pre-turn compress alone can't defend the window.
+            compact: async (h) => {
+              const out = await maybeCompress({
+                messages: h,
+                contextWindow: contextWindowFor(chosenModel),
+                protect: store.render() || undefined,
+                summarize: async (older) => {
+                  const r = await connector.chat({ model: fastModel, messages: [{ role: 'user', content: SUMMARY_PROMPT + renderForSummary(older) }], maxTokens: 700 });
+                  return r.text || '';
+                }
+              });
+              if (out.compressed) emitProgress({ type: 'process', kind: 'mid-turn-compact', tokensBefore: out.tokensBefore });
+              return out.messages;
+            }
           });
           if (result.aborted && !result.reply) result.reply = '⏹ Stopped at your request — the work above was kept.';
 
@@ -1418,6 +1936,34 @@ function registerIpc() {
           // A wandering turn must never be an unrecorded, undocumented turn —
           // and plan_steps=0 in turn_metrics makes the wandering measurable.
           if (coding && !result.aborted && projectId && turnMutated(result.toolTrace)) {
+            // O26 on the flat path: a wandering turn faces the same gate —
+            // check, ONE bounded fix step on failure, and an honest record.
+            try {
+              const c0 = await runTurnCheck('turn');
+              if (c0 && !c0.ok && !isAborted()) {
+                const fixStep = {
+                  id: 1, task: 'The project check command FAILED after your changes:\n' + c0.output
+                    + '\nFix the ROOT CAUSE so the check passes. NEVER delete, skip, or weaken a failing test to reach green; if a test itself is wrong, say so explicitly.',
+                  produces: 'the project check command passing'
+                };
+                const fr = await executeStep({ chat: chatAbortable, callTool, model: chosenModel, step: fixStep, tools: orchestratorTools.filter((t) => t.name !== 'set_variable'), history: convo, store, onEvent: emitProgress, isAborted });
+                result.toolTrace.push(...(fr.toolTrace || []));
+                await runTurnCheck('post-fix');
+                if (checkState.failing) {
+                  try {
+                    const d = projectDocs.appendDebt({ projectId, docsBase, findings: [{ lens: 'check', severity: 'high', file: '(project)', issue: `check command (${coding.checkCommand}) failing at turn end`, fix: 'fix the root cause', status: 'unresolved' }] });
+                    if (d.added) emitProgress({ type: 'process', kind: 'debt', added: d.added, repeats: d.repeats, version: d.version });
+                  } catch (e) { console.error('[debt]', e && e.message); }
+                }
+              }
+              // The flat path's reply is the STREAMED text, not result.reply —
+              // an appended string would never reach the bubble or the saved
+              // message. The marker rides a flag the renderer applies, exactly
+              // like `truncated`.
+              if (checkState.ran && checkState.failing) {
+                result.checkFailing = true; result.checkCommand = coding.checkCommand;
+              }
+            } catch (e) { console.error('[flat check]', e && e.message); }
             try {
               const c = await commitStep(project.working_dir, `turn: ${String(text).slice(0, 150)}`);
               if (c && c.committed) emitProgress({ type: 'process', kind: 'step-commit', step: 'turn' });
@@ -1444,7 +1990,7 @@ function registerIpc() {
           const filtered = Math.ceil((t.filteredChars != null ? t.filteredChars : t.resultChars || 0) / 4);
           return { name: t.name, rawTokens: raw, resultTokens: filtered, saved: Math.max(0, raw - filtered), rules: t.rules || [], truncated: !!t.truncated, isError: t.ok === false };
         });
-        if (trace.length) _e.sender.send('chat:progress', { type: 'internals-tools', trace });
+        if (trace.length) _e.sender.send('chat:progress', { turnId, type: 'internals-tools', trace });
       } catch (e) { console.error('[internals tools]', e && e.message); }
 
       // Telemetry (objective 0): record real usage + reductions for this turn.
@@ -1479,6 +2025,22 @@ function registerIpc() {
           planRefines: planInfo ? planInfo.replans : 0,
           varsCaptured: Math.max(0, store.size - varsAtStart)
         };
+        // Cost outlier (O14): plan_refines and input tokens were both recorded
+        // and neither was ever WATCHED — a 3-step plan that grew to 8 steps and
+        // burned 1.07M input tokens passed without comment. Compared against
+        // this project's own recent median, so there is no magic constant
+        // beyond the multiple; needs a real history before it can speak.
+        try {
+          const prior = repo.metrics.listByProject(projectId, 20).filter((m) => m.measured && m.input_tokens > 0);
+          const median = medianOf(prior.map((m) => m.input_tokens));
+          if (median && metricRow.inputTokens > median * COST_OUTLIER_FACTOR) {
+            emitProgress({
+              type: 'process', kind: 'cost-outlier',
+              inputTokens: metricRow.inputTokens, median, factor: +(metricRow.inputTokens / median).toFixed(1),
+              replans: metricRow.planRefines, steps: metricRow.planSteps
+            });
+          }
+        } catch (e) { console.error('[cost outlier]', e && e.message); }
         repo.metrics.record(metricRow);
         // Per-task rows: sub-agents (collected during the loop) + each tool call.
         for (const t of (result.toolTrace || [])) {
@@ -1487,10 +2049,38 @@ function registerIpc() {
         try { repo.metrics.recordTasks(taskLog.map((t) => ({ ...t, projectId: projectId || null, chatId: payload?.chatId || null }))); } catch (e) { console.error('[task metrics]', e && e.message); }
         const cachePct = metricRow.inputTokens ? Math.round((metricRow.cachedTokens / metricRow.inputTokens) * 100) : 0;
         console.log('[metrics]', JSON.stringify({ measured: metricRow.measured, model: metricRow.model, input: metricRow.inputTokens, output: metricRow.outputTokens, cached: metricRow.cachedTokens, cachePct, est: metricRow.estInputTokens, filterSaved: metricRow.filterSavedTokens, skillSaved: metricRow.skillSavedTokens, delegated: metricRow.delegated, durationMs: metricRow.durationMs, tasks: taskLog.length, planningFailed: metricRow.planningFailed, toolFellBack: metricRow.toolFellBack }));
-        _e.sender.send('chat:progress', { type: 'metrics', ...metricRow, tasks: taskLog });
+        _e.sender.send('chat:progress', { turnId, type: 'metrics', ...metricRow, tasks: taskLog });
       } catch (e) { console.error('[metrics]', e && e.message); }
 
-      return { model: chosenModel, reply: result.reply, provider: provider.type, toolTrace: result.toolTrace, compressed, usage: result.usage || null, planned: !!result.planned, aborted: !!result.aborted };
+      // O31: file the session — title (when untitled), one-line summary, and
+      // faceted tags — AFTER the reply returns, non-blocking (one fast-model
+      // call must never add latency to the turn). Completion announces itself
+      // on librarian:update so the sidebar refreshes whenever it lands.
+      if (chatId && projectId && !result.aborted) {
+        const sender = _e.sender;
+        (async () => {
+          try {
+            const chatRow = repo.chats.get(chatId);
+            // The reply may not be persisted yet (the renderer saves it after
+            // this handler returns) — include this turn's text directly.
+            const msgs = [...repo.messages.listByChat(chatId), { role: 'assistant', content: String(result.reply || '').slice(0, 2000) }];
+            const filed = await librarian.fileSession({
+              connector, model: fastModel, messages: msgs,
+              currentTitle: (chatRow && chatRow.title) || '',
+              vocabulary: buildVocabulary(projectId)
+            });
+            if (filed.summary) repo.chats.setSummary(chatId, filed.summary);
+            if (filed.title && !(chatRow && chatRow.title)) repo.chats.rename(chatId, filed.title);
+            for (const t of (filed.tags || [])) {
+              const tag = repo.tags.ensure(projectId, t.facet, t.name);
+              if (tag) repo.tags.tagChat(chatId, tag.id);
+            }
+            try { sender.send('librarian:update', { chatId, projectId, titled: !!(filed.title && !(chatRow && chatRow.title)), summarized: !!filed.summary, tags: (filed.tags || []).length }); } catch {}
+          } catch (e) { console.error('[librarian:session]', e && e.message); }
+        })();
+      }
+
+      return { model: chosenModel, reply: result.reply, provider: provider.type, toolTrace: result.toolTrace, compressed, usage: result.usage || null, planned: !!result.planned, aborted: !!result.aborted, truncated: !!result.truncated };
     }
 
     // The renderer should never let a send reach here without a provider (see
@@ -1499,4 +2089,7 @@ function registerIpc() {
   });
 }
 
-module.exports = { registerIpc };
+// medianOf gates the cost-outlier signal and had no coverage — it silently
+// returns 0 below MIN_COST_HISTORY, which is exactly why the signal never
+// fired during testing (every drive created a fresh project with no history).
+module.exports = { registerIpc, documentPathAllowed, medianOf, COST_OUTLIER_FACTOR, MIN_COST_HISTORY };

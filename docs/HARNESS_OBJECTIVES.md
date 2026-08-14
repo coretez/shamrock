@@ -44,13 +44,17 @@ sentence, so flat-loop turns are not. Sliver: add it to the note in ipc.js).
 (1) scope jail, never bypassable; (2) action approval for what git cannot
 undo — reads free, file writes/edits auto-approved WHEN the working dir is a
 git repo (rollback exists; per-file prompts don't scale to real projects),
-shell always asks; (3) bypass (extends to shell) only where rollback exists
-(git), enforced in main, revocable and visible.
+shell always asks; (3) bypass — in effect a SHELL bypass, since writes are
+already free with git. Honest framing: git does NOT roll back shell effects
+(network, installs, deletes outside the tree), so the standing grant is
+confirmed by a main-process dialog stating exactly that risk — a renderer
+message alone cannot flip it. Still git-gated, revocable, and visible.
 *Source: Claude Code permission modes; Harness.io approval stages; usage
 feedback — per-file approval was unusable at project scale.*
 Accept: deny mutates nothing and tells the model not to retry; writes flow
 without prompts in a git repo and ask without one; shell prompts unless
-bypassed; bypass ignored without `.git`; standing bypass shows a chip.
+bypassed; bypass ignored without `.git`; enabling bypass requires the
+main-side confirmation; standing bypass shows a chip.
 **Status: SHIPPED.**
 
 **O5. Reviewable approvals.** An approval must show what will actually
@@ -82,9 +86,30 @@ form with write-in; live-verified).
 **O8. Decisions are durable.** Ratified user decisions persist as
 `user`-confidence variables — overwrite-protected against model guesses,
 re-injected into every future step and plan.
+
+*The failure mode, measured 2026-08-14.* `record` sits in the same tool call
+as `goal`, `steps`, `produces` and `merge` — every one of which is scoped to
+THIS request — and then asks the opposite question: what outlives it. The
+planner answers in the frame it is already in, and proposes the request's
+own parameters. Observed live under permissive wording: `output_path`,
+`output_format` (run 1, which reached the SPEC), then `output_target`,
+`format`, `scope` (isolated A/B). **The junk keys differ every run**, so the
+guard has to be an allowlist of durable keys — a denylist cannot enumerate
+what it has not seen. Two layers, each independently verified: naming the
+legal keys in the schema stops most proposals at the source, and the
+vocabulary filter rejects the rest. Asymmetry that sets the bias: a false
+positive lands at `user` confidence and is therefore STICKY — no later
+observation can overwrite it — while a false negative costs nothing, since
+the user can simply restate. Reject when unsure.
+
 Accept: a decision stated by the user reaches the store via the plan's
-`record` field. **Status: SHIPPED** (record → store at `user` confidence +
-SPEC decision records).
+`record` field; a task parameter never does, and the rejection is visible
+(`records` event: proposed/kept/dropped). **Status: SHIPPED** (record →
+store at `user` confidence + SPEC decision records; durable-key vocabulary
++ dropped-key reporting). *Open, in DEBT:* an inferred record is stored at
+`user` confidence with `source: 'align'` though nothing verifies a
+ratification, and `record` is offered on every turn while its sibling
+`decisions` is mode-gated.
 
 **O9. The plan is the git history.** Each completed step that mutated the
 working tree commits with its `produces` as the message — the typed plan
@@ -147,8 +172,32 @@ from the actual changed file contents — the planner is explicitly told NOT
 to plan documentation steps (planned doc steps produced untouched skeletons
 and narrative sludge). Docs are real versioned files in the project output
 dir (in-repo when a working dir exists), indexed in the library.
+*The list insight (2026-08-14).* These documents are LISTS — SPEC is objectives
+with stable ids, DEBT is a checklist with keys, a plan is ordered steps. Plain-
+text list practice (todo.txt; Org mode; agile backlog refinement) has three
+lessons the canonical set has not taken:
+- **Entries are DATA, not prose.** todo.txt puts state, priority, dates,
+  `+project`, `@context` and `key:value` in a fixed order on one line so
+  standard tools can sort and filter it. DEBT buries lens/severity/file in a
+  sentence; it is greppable by luck, not by design.
+- **Scale comes from VIEWS, not from filing.** Org mode holds thousands of
+  tasks across hundreds of files and stays usable because nobody reads the
+  files — they read an agenda that queries across them. Shamrock does the
+  opposite: `load()` injects the WHOLE canonical set into every planning call,
+  so each document costs tokens on every turn whether or not it is relevant,
+  and gets less useful as it grows. The planner wants "open high-severity
+  findings touching the files this plan names", not four documents.
+- **Lists rot without a cadence.** A backlog left alone becomes a graveyard of
+  vague, outdated items; refinement is a recurring practice, and untouched
+  entries get archived. O30 grooms the CODE. Nothing grooms the ledger — twice
+  in one session an entry stayed open after its fix had shipped.
+Also missing: a workflow beyond the `- [ ]`/`- [x]` binary (the ledger already
+has a de-facto third state, PROMOTE TO GATE, encoded in prose), and any WIP
+bound — O11 caps a fix cycle at one, but nothing caps the ledger.
+
 *Source: docs-as-code; Architecture Decision Records (Nygard); Diátaxis;
-requirements traceability.*
+requirements traceability; todo.txt; GNU Org mode agenda; agile backlog
+refinement.*
 Accept: an align `record` bumps the SPEC doc with the decision appended;
 `planContext` carries the docs under a source-of-truth banner;
 DERIVE_PROMPT carries the documentation rule; both execution paths run the
@@ -199,10 +248,20 @@ is a PASSTHROUGH — undefined firewall/guardrails is a valid, zero-cost
 state; the chain's existence is the contract, not any particular module.
 *Source: OpenAI Agents SDK guardrails/tripwires; NeMo Guardrails rail
 taxonomy; LLM gateway egress scrubbing; Harness.io gates.*
+**Every guard reports its DENOMINATOR, not only its rejections.** A module
+that emits solely on block/rewrite makes silence ambiguous: "nothing was
+inspected", "nothing matched", and "the module never ran" all look identical
+from outside, so a broken guard is indistinguishable from a working one.
+Each inspection therefore reports what it saw as well as what it did
+(`inspected`, `allowed`, `blocked/rewritten/flagged`). Learned the hard way
+on the O8 record filter: a dropped-only event led to a confident claim that
+the guard had rejected junk when in fact nothing had ever been proposed to
+it — the guard had not run at all.
 Accept: filter.js, the approval gate, and the env scrub are re-expressed as
 registry guards with zero behavior change; an IN-2 injection scanner and an
 EG-2 secret scrub ship as the first new modules; every verdict lands in
-process events.
+process events; a point that inspected zero items is distinguishable from a
+point that inspected many and allowed them all.
 **Status: PLANNED** (design: the internal design record §4).
 
 **O18. The guard chain is a deployable boundary — group proxy with access
@@ -354,10 +413,264 @@ Structured widget data is what makes the verify pass mechanical: numbers
 in a chart are checkable against collected values.
 *Source: the MSSP report skills hand-author these today — proof of need;
 one shared renderer replaces N hand-rolled ones.*
+*Scope correction (2026-08-14): this is the RENDER SURFACE, not a document
+feature.* Rich content arrives from three directions and today only one of
+them renders at all. The model emits fenced blocks — a ```mermaid diagram
+displays as SOURCE because renderer.js captures the fence language and then
+renders every block as `<pre>`. MCP tool results carry `image`, `audio` and
+embedded `resource` blocks — `mcp/client.js` filters to `type === 'text'` and
+DISCARDS the rest silently, so a server returning a chart produces a result
+that looks thin to the model, with no error and nothing in the glass box.
+Documents want the same widgets. One renderer serves all three, or each grows
+its own and they drift.
+
+The split that decides sequencing is TRUST, not source:
+- **Model-authored data** (a mermaid fence, a `{widget, data}` block) is data
+  we render ourselves with a deterministic renderer — no markup from
+  elsewhere, no script. This is safe to ship NOW and does not wait on O17.
+  Mermaid in chat + html + pdf is the first slice and the smallest one.
+- **Server-supplied content** (MCP `image`/`resource`, `ui://` app resources)
+  is untrusted input from an external process. Preserving it is safe and
+  urgent — a dropped block must at minimum leave a visible marker naming what
+  was dropped, because silent loss is the same lie the guard chain exists to
+  prevent. RENDERING it is a trust-boundary change and waits for O17 EG-3;
+  rendering server HTML inside a CSP-locked, sandboxed renderer would hand an
+  external server the scripting surface Phase 4 closed.
+
 Accept: identical widget data renders in all three types; a chart in a
 pdf has no external requests; the verify pass can read widget data
-without parsing markup.
-**Status: PLANNED** (design: the internal design record §5).
+without parsing markup; a ```mermaid fence renders as a diagram rather than
+source; an MCP content block that cannot be rendered yet still leaves a
+marker instead of vanishing.
+**Status: PLANNED** (design: the internal design record §5). Sequencing:
+mermaid render → MCP drop-markers → widget library → `ui://` behind EG-3.
+
+## G. Rules → gates — the rulebook is enforced, not advisory
+
+`docs/AGENT_RULES.md` is the prompt-facing rulebook (distilled from Anthropic,
+OpenAI, and Moonshot first-party guidance). Its meta-rule is the contract for
+this ring: **a rule violated twice is promoted into a gate** — a framework-run
+check, a guard module, or a prompt-contract line. These objectives wire the
+rulebook's non-negotiables into deterministic gates so the rules stop being
+probabilistic compliance.
+
+**O26. The check command is a framework gate.** A per-project check command
+(tests / lint / build — from project settings, or discovered from the repo)
+is run by the FRAMEWORK, never by planner memory: (1) at turn start in coding
+mode, before the first mutation, to establish a baseline — pre-existing
+breakage is attributed, not inherited; (2) after every mutating step, with
+failures injected back into the step loop under the root-cause rule (fix it,
+never suppress it); (3) its final result feeds synthesis and anchors the O11
+review as its first deterministic lens. Success is silent; failure is verbose.
+*Source: OpenAI harness engineering ("promote the rule into code"); Anthropic
+best practices ("give Claude a check it can run"); Kimi K2 verifiable rewards
+over rubric judgment; AGENT_RULES §Verification.*
+Accept: a mutating turn with a configured check runs baseline + per-step
+checks; a failing check blocks step completion until fixed or escalated (O12
+bounds apply); check results land in process events and in the review pass.
+**Status: SHIPPED (v1)** — `check_command` per-project setting (Overview
+card), granted through the SAME main-side confirmation as the O4 bypass
+(it is standing consent to run shell unprompted — a renderer message alone
+cannot install it). The baseline runs LAZILY, immediately before the
+turn's first mutation, so a question-only turn never pays for a slow suite
+while attribution is preserved (a pre-existing failure is labelled as not
+the model's). Gated on **all three paths**: per-step in execute.js (one
+bounded fix step on failure; fix steps re-check but never re-insert — no
+spiral; a step that ran the check itself last and successfully is not
+re-run), one post-parallel check covering sub-agent mutations the isolated
+traces hide, and one check on a mutating flat turn. A check still failing
+at turn end reaches synthesis as an incomplete step-result, anchors the
+O11 review as its first deterministic finding, sets the reply's honesty
+marker, and lands in the DEBT ledger. Smoke-covered.
+
+**O27. Findings are durable — the debt ledger.** Findings the ONE bounded
+O11 fix cycle leaves unfixed, and recurring evaluator findings, append to a
+tech-debt tracker doc in the O15 canonical set (DEBT) — finding, source turn,
+rule violated. A finding recorded twice becomes a promotion candidate: the
+app surfaces "promote to gate" — extend the O26 check command or register an
+O17 guard module. Nothing evaporates; scope discovered off-task is recorded,
+not chased.
+*Source: OpenAI tech-debt-tracker + "human taste captured once, enforced
+continuously"; AGENT_RULES meta-rule + §Scope.*
+Accept: an unfixed review finding appears in the tracker with its source
+turn; a repeat finding is flagged as a promotion candidate.
+**Status: SHIPPED (v1)** — DEBT joins the O15 canonical set
+(project-docs.js appendDebt); review findings that consumed the fix cycle
+land as "fix attempted — unverified", unresolved check failures as
+"unresolved", drift findings as "drift scan"; a repeated key is flagged
+**REPEAT ×N — PROMOTE TO GATE**. Smoke-covered. Deferred: evaluator
+(stage L) findings feeding the ledger.
+
+**O28. Test integrity — stated rule, then action guardrail.** CODING_RULES
+gains the line: a failing test is never removed or weakened to reach green —
+fix the root cause; editing the test is legitimate only when the test itself
+is wrong, and the step must say so. When O17 lands, an EG-1 action guardrail
+enforces it: a mutation to a test file while the current step is a
+verification/fix step gets verdict `flag` — routed to the approval prompt
+even under O4 bypass.
+*Source: Anthropic long-running harness ("it is unacceptable to remove or
+edit tests" — feature ledger is append-only); AGENT_RULES §Verification.*
+Accept: DERIVE_PROMPT and the CODING MODE note carry the rule now; with
+guards live, a test-file edit inside a fix step prompts despite bypass.
+**Status: PARTIAL** — the rule text shipped in both places (TEST INTEGRITY
+in CODING_RULES; the runtime CODING MODE note; every check-gate fix prompt
+restates it). The EG-1 action guardrail rides O17. Smoke-covered.
+
+**O29. The repo speaks first — map + rulebook injection.** Pass 2 receives
+a depth-2 repo map so plans name real files, not imagined ones; and a
+working-dir rulebook (`AGENT_RULES.md` | `AGENTS.md` | `CLAUDE.md`, first
+found) is auto-injected beside the cheat sheet under a rulebook banner.
+Injection is a ledger event — visible in the assembled-prompt viewer like
+everything else. No rulebook, silent pass: the chain's existence is the
+contract (same posture as O17 passthrough).
+*Source: OpenAI AGENTS.md-as-table-of-contents / progressive disclosure —
+"anything the agent can't access effectively doesn't exist";
+AGENT_RULES §Intent.*
+Accept: a plan against a real repo names only existing paths or
+explicitly-new ones; the rulebook shows in the assembled prompt;
+its token cost appears in the ledger.
+**Status: SHIPPED** — the depth-2 repo map already fed Pass 2; the
+rulebook half now ships: readRulebook (project-docs.js — AGENT_RULES.md ▸
+docs/AGENT_RULES.md ▸ AGENTS.md ▸ CLAUDE.md, first found) injected into
+the CODING MODE note (execution) and planContext under the PROJECT
+RULEBOOK banner (planning + refinement), with a `rulebook` process event.
+No rulebook = silent passthrough. Smoke-covered.
+
+**O30. Drift pass — backward-looking garbage collection.** Per-turn review
+(O11) sees one turn; drift is a cross-turn phenomenon and currently
+invisible. A maintenance turn — user-invoked first, schedulable later —
+scans the working tree against SPEC/DESIGN and the rulebook's golden
+principles, plus doc-gardening over the O15 set (docs contradicting the code
+they describe). Findings land in the O27 ledger; small fixes run as ONE
+bounded fix plan with ordinary step-commits and O4 gates — debt is paid
+continuously in small increments, never in heroic bursts.
+*Source: OpenAI entropy/GC — recurring golden-principles scans +
+doc-gardening agents, after Friday cleanup failed to scale;
+AGENT_RULES §Scope.*
+Accept: a drift turn on a seeded repo yields tracker entries and a bounded
+fix commit; it never mutates outside the O4 permission gates; clean is a
+first-class outcome.
+**Status: SHIPPED (v1)** — drift.js scans the ~8 most recently modified
+source files against the rulebook + canonical docs with a drift lens
+(doc-staleness findings filed against the doc names); findings → DEBT
+ledger; strictly READ-ONLY (fixes run as ordinary turns with ordinary
+gates — a stronger guarantee than the accept's "fix commit", which is
+deliberately left to the user). User-invoked: Overview → MAINTENANCE.
+Smoke-covered. Deferred: scheduling.
+
+**O31. The Librarian — the library organizes itself.** Documents pile up and
+sessions pile up; a flat list stops working around twenty items, and a growing
+project must stay findable without the user filing anything. One fast-model
+call files each artifact — at save time for documents (normalizing
+type/entity/period against the project's EXISTING vocabulary before the
+deterministic template places the file) and at turn end for sessions (title
+when untitled, one-line summary, tags) — with deterministic validation
+(librarian.js) deciding what lands: known facets only (topic / kind / entity /
+period / status), slug-deduped, capped at 5, existing spellings win over fresh
+coinage even when the model ignores instructions. Organization is VIRTUAL:
+faceted tags over documents AND chats (shared vocabulary → the cross-cutting
+view: one tag filters deliverables and sessions together), views pivot
+(recency / kind / entity / topic), and nothing ever moves on disk — the
+`.versions/` chains and saved paths stay intact. A bounded on-demand tidy pass
+files the backlog. Filing can never break a save or a turn (failure = saved
+unfiled), never blocks the reply (session filing runs after the turn returns,
+announcing itself on `librarian:update`), and every tag carries provenance
+(librarian vs user).
+*Source: the mess observed live — libraries and session lists rot as they
+grow; multi-tag facets because no single organization fits every retrieval.*
+Accept: spelling variants of a tag land on one row (slug dedupe); a filing
+failure still saves the document; the session list shows librarian summaries;
+a tag click filters documents and chats together; tidy is bounded and
+reversible. **Status: SHIPPED (v1)** — librarian.js + tags schema (v20) +
+save/turn wiring in ipc.js + library views in the renderer; smoke-covered.
+Extensions: user tag editing in the reader, entity rollups, auto-archive
+suggestions for stale sessions.
+
+**O32. The Registrar — the canonical docs are a managed list, not prose.**
+The canonical set is already made of LISTS (objectives with ids, findings with
+keys, decision records, the traceability table) but each one is hand-tended,
+and hand-tending fails: twice in one session a DEBT entry stayed open after
+its fix had shipped, and O8's own text carries an *"Open, in DEBT"* note that
+nothing verifies. An internal, deterministic list service owns five verbs over
+those lists — the model never has to remember to call it, like step-commits
+and the doc-writer.
+
+- **CREATE** — append an item with a stable key, structured fields, and a
+  state. Fields are DATA in fixed positions (`state · sev · lens · file ·
+  issue · fix · key`), the todo.txt lesson: sortable and filterable by
+  ordinary tools rather than greppable by luck. `appendDebt` is the v0 of this
+  verb and migrates onto it.
+- **MAINTAIN** — edit fields and move state. State is a WORKFLOW, not the
+  `- [ ]`/`- [x]` binary: at minimum open → fixed-unverified → closed, plus
+  the promote-to-gate state the ledger already expresses in prose because it
+  has nowhere else to put it.
+- **VALIDATE — the integrity pass, prose ↔ items, both directions.**
+  Deterministic and cheap; every check is a grep, not a model call:
+  *items → prose*: an item names a file that no longer exists; an item's
+  claimed fix (a named symbol) is absent from the tree; a closed item whose
+  symbol vanished — a regression.
+  *prose → items*: an objective marked PARTIAL or PLANNED with no open item
+  or plan reference; an *"Open, in DEBT"* note with no matching open item; an
+  objective missing from the traceability table, or a table row pointing at a
+  path that does not exist; an item marked open whose fix IS present in the
+  tree — the exact drift that bit twice.
+- **CLOSE** — ticking requires evidence, not intent: the named symbol present,
+  or the smoke assertion that pins it named on the item. An item cannot close
+  itself by being forgotten.
+- **LIST VIEW — the agenda, and the point of the whole objective.** Org mode
+  holds thousands of tasks because nobody reads the files; they read a query.
+  `project-docs.load()` today injects the WHOLE canonical set into every
+  planning call, so a document costs tokens on every turn regardless of
+  relevance and gets worse as it grows — precisely backwards. The planner gets
+  a VIEW ("open high-severity items touching the files this plan names"), the
+  user gets one in the DOCUMENTS tab, and a document that never satisfies a
+  query is thereby visibly dead — the use-signal the O15 entry asks for.
+*Checked against what list tools actually ship, so the gaps are chosen rather
+than forgotten.* Carried in from the five verbs above: stable ids, states,
+priority, structured fields, queries, archiving. **Also required, and absent
+from the first cut:**
+- **Item ↔ objective link.** This whole repo is built on O-ids that commits and
+  design elements cite — yet a finding names a `file` and no objective. An item
+  carries the id it belongs to (`O26`), so an objective can list its own open
+  items and the *"Open, in DEBT"* notes stop being unverifiable prose. This is
+  the prose↔item edge made structural, and it is what makes VALIDATE cheap.
+- **Auto-close from a commit.** Trackers close an item when a commit cites it.
+  Shamrock already writes step-commits (O9) — a commit naming an item key closes
+  it with the commit as the evidence CLOSE demands. This alone would have
+  prevented both observed drifts, because closing would not have depended on
+  anyone remembering.
+- **Dependencies / blocked-by.** Real and currently prose-only: O28's guardrail
+  half waits on O17, EG-3 gates the MCP rich-content work, O18/O19 wait on
+  O17 A–D. A view that cannot say "ready" versus "blocked" ranks unreachable
+  work alongside reachable work.
+- **Annotations, append-only.** Org logs state changes; Taskwarrior appends
+  notes. Editing an item in place loses WHY it moved — the two ledger
+  corrections this session rewrote lines and kept the reasoning only because a
+  human wrote it back in.
+- **Age and archive.** Every item already carries a date, so staleness is
+  computable. Untouched-for-N moves to archived rather than lingering; an
+  age-weighted rank (Taskwarrior's urgency idea) surfaces the graveyard on its
+  own instead of waiting for someone to notice.
+- **A WIP bound on the open list.** O11 caps a fix cycle at one and O26 caps
+  fix insertion at one; nothing caps the ledger, which reached 14 entries in a
+  day. Past the bound, adding requires closing or archiving — "stop saying
+  maybe later" enforced rather than intended.
+*Deliberately NOT taken (single-operator tool, and each would be ceremony):*
+assignees, estimation/sizing, milestones, recurrence, comment threads, item
+templates. Provenance is covered by `lens` (which pass found it); recurrence
+is the O30 cadence's job, not an item's.
+
+*Source: todo.txt (fixed-position fields, key:value, one line per item); GNU
+Org mode (workflow states, agenda, state-change logging, archiving); Taskwarrior
+(dependencies, annotations, age-weighted urgency); issue trackers (close-from-
+commit, cross-references); agile backlog refinement (lists rot without a
+cadence; archive the untouched; bound the WIP).*
+Accept: the integrity pass finds the two real drifts already observed (an open
+item whose fix shipped; an objective note with no matching item) with zero
+model calls; a plan receives a filtered view rather than four whole documents,
+and the tokens saved are visible in the ledger; closing an item without
+evidence is refused; the pass runs on the O30 cadence and its findings land in
+DEBT like any other. **Status: PLANNED.**
 
 ---
 
@@ -383,7 +696,14 @@ without parsing markup.
 | O22 | document lifecycle + review lenses | shipped: DOCUMENTS_RULES + documents-mode align (`plan-derive.js`); planned: lenses in `review.js` |
 | O23 | placement taxonomy + management | planned — `documents.js` placementPath property tokens; `repo.documents` verbs |
 | O24 | format/type split + deterministic render | shipped: html→pdf (`render-pdf.js` + `documents:toPdf`) + format targets v1 (ipc.js documents block + `plan-derive.js` FORMAT TARGET rule); planned: format rows, md target, schema migration |
+| O32 | the Registrar — list service over the canonical docs | planned — new `registrar.js`; migrates `project-docs.appendDebt`; VALIDATE runs on the O30 cadence; LIST VIEW replaces whole-set injection in `project-docs.load()` |
 | O25 | widget library | planned — new `widgets.js` deterministic renderer (SVG + md degradations) |
+| O26 | framework check gate | shipped: `runCheckCommand` (coding-tools.js) + `gateStep` (execute.js) + baseline/final wiring + Overview CHECK COMMAND card (ipc.js, renderer); smoke §O26 |
+| O27 | debt ledger + promotion | shipped: DEBT canonical doc + `appendDebt` repeat flagging (project-docs.js); review/check/drift findings wired in ipc.js; smoke §O27. Deferred: evaluator feed |
+| O28 | test-integrity rule + guardrail | partial: rule in `plan-derive.js` CODING_RULES + ipc.js CODING MODE note + fix prompts; EG-1 module rides O17 `guards.js` |
+| O29 | repo map + rulebook injection | shipped: `readRulebook` (project-docs.js) → CODING MODE note + `planContext` banner + process event; smoke §O29 |
+| O30 | drift pass | shipped: `drift.js` + `project:drift` IPC + Overview MAINTENANCE card; findings → O27; smoke §O30. Deferred: scheduling |
+| O31 | the Librarian — self-organizing library + sessions | shipped v1: `src/main/librarian.js` + tags/chat_tags/document_tags (db v20) + save-time/turn-end filing (`ipc.js`) + faceted views + tidy (renderer) |
 
 ---
 

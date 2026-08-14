@@ -220,6 +220,7 @@ function renderAssistantBody(el, text) {
     bar.insertBefore(openBtn, toggle);
     const frame = document.createElement('iframe'); frame.className = 'htmlpreview'; frame.setAttribute('sandbox', '');
     frame.src = URL.createObjectURL(new Blob([raw], { type: 'text/html' }));
+    frame.onload = () => { try { URL.revokeObjectURL(frame.src); } catch {} };
     const pre = document.createElement('pre'); pre.className = 'codeblock'; pre.hidden = true; pre.textContent = raw;
     let showingSource = false;
     toggle.onclick = () => { showingSource = !showingSource; frame.hidden = showingSource; pre.hidden = !showingSource; toggle.textContent = showingSource ? '▷ preview' : '</> source'; };
@@ -234,7 +235,11 @@ function applyTheme() {
   else el.html.removeAttribute('data-b-theme');
   el.themeBtn.textContent = state.theme === 'dark' ? 'LIGHT' : 'DARK';
 }
-function toggleTheme() { state.theme = state.theme === 'dark' ? 'light' : 'dark'; applyTheme(); }
+function toggleTheme() {
+  state.theme = state.theme === 'dark' ? 'light' : 'dark';
+  applyTheme();
+  try { window.api.settings.set('ui_theme', state.theme); } catch {}
+}
 
 // ── Model switcher (dynamic, from providers) ──────────────────────
 function providerModels(p) {
@@ -417,6 +422,7 @@ function renderOverview() {
   }
   renderOverviewScope();
   loadBuildEnv(p.id);
+  loadCheckCommand(p.id);
   loadDocTargets(p.id);
   updateModelSwitch();
 }
@@ -502,6 +508,49 @@ async function saveBuildEnv() {
   else { msg.textContent = 'saved'; msg.className = 'test-result'; }
   try { await window.api.settings.set('build_env', ta.value, pid); } catch {}
   setTimeout(() => { msg.textContent = ''; }, 2500);
+}
+
+// O26 — the per-project check command (Overview): the framework runs it at
+// turn start and after every mutating step in coding mode.
+async function loadCheckCommand(projectId) {
+  const ta = document.getElementById('ov-check');
+  if (!ta || ta.dataset.projectId === String(projectId)) return;
+  try { ta.value = (await window.api.settings.get('check_command', projectId)) || ''; } catch { ta.value = ''; }
+  ta.dataset.projectId = String(projectId);
+  document.getElementById('ov-check-msg').textContent = '';
+}
+async function saveCheckCommand() {
+  const pid = state.currentProjectId; if (!pid) return;
+  const ta = document.getElementById('ov-check');
+  const msg = document.getElementById('ov-check-msg');
+  try {
+    // Main confirms a non-empty command in its own dialog (second wall) —
+    // a cancel there must leave the stored value alone AND the field honest.
+    const r = await window.api.settings.set('check_command', ta.value.trim(), pid);
+    if (r && r.cancelled) {
+      ta.value = (await window.api.settings.get('check_command', pid)) || '';
+      msg.textContent = 'cancelled'; msg.className = 'test-result test-result--error';
+    } else { msg.textContent = 'saved'; msg.className = 'test-result'; }
+  } catch { msg.textContent = 'failed'; msg.className = 'test-result test-result--error'; }
+  setTimeout(() => { msg.textContent = ''; }, 2500);
+}
+
+// O30 — the drift scan (Overview → MAINTENANCE): read-only; findings land in
+// the DEBT ledger. Uses the currently selected model connection.
+async function runDriftScan() {
+  const pid = state.currentProjectId; if (!pid) return;
+  const msg = document.getElementById('ov-drift-msg');
+  const model = state.selected?.model;
+  const prov = model ? resolveProvider(model) : {};
+  if (!prov.providerId) { msg.textContent = 'select a model first'; msg.className = 'test-result test-result--error'; return; }
+  msg.textContent = 'scanning…'; msg.className = 'test-result';
+  try {
+    const res = await window.api.projects.drift({ projectId: pid, providerId: prov.providerId, model });
+    msg.textContent = res.error ? res.error
+      : res.findings.length ? `${res.findings.length} finding${res.findings.length === 1 ? '' : 's'} → DEBT ledger (${res.scanned} files scanned${res.repeats ? `, ${res.repeats} repeat${res.repeats === 1 ? '' : 's'} — promote to gate` : ''})`
+        : `clean — ${res.scanned} files scanned`;
+    msg.className = res.error ? 'test-result test-result--error' : 'test-result';
+  } catch (e) { msg.textContent = e?.message || 'failed'; msg.className = 'test-result test-result--error'; }
 }
 
 async function saveCheatSheet() {
@@ -599,10 +648,17 @@ async function setFastModel(providerId, model) {
 
 function renderChats() {
   el.chatList.innerHTML = '';
-  for (const c of state.chats) {
+  // The librarian's cross-cutting view: an active library tag filters the
+  // session list too — "everything about acme", chats and documents alike.
+  const chats = state.libraryTag ? state.chats.filter((c) => hasTag(c, state.libraryTag)) : state.chats;
+  for (const c of chats) {
     const li = document.createElement('li');
     li.className = 'list__item list__item--chat' + (c.id === state.currentChatId ? ' is-selected' : '');
-    li.innerHTML = `<div class="chatrow"><div class="chatrow__text"><div class="title">${escapeHtml(c.title || 'Untitled chat')}</div><div class="sub">${escapeHtml((c.model || 'no model').toLowerCase())}</div></div><div class="chatrow__actions"><button class="rowbtn" title="Rename">✎</button><button class="rowbtn" title="Delete">✕</button></div></div>`;
+    // The one-line summary (librarian) beats the model name as the subtitle —
+    // it says what the session IS, which is what you scan the list for.
+    const sub = c.summary || (c.model || 'no model').toLowerCase();
+    li.innerHTML = `<div class="chatrow"><div class="chatrow__text"><div class="title">${escapeHtml(c.title || 'Untitled chat')}</div><div class="sub">${escapeHtml(sub)}</div></div><div class="chatrow__actions"><button class="rowbtn" title="Rename">✎</button><button class="rowbtn" title="Delete">✕</button></div></div>`;
+    if (c.summary) li.title = c.summary + ((c.tags || []).length ? `\n${c.tags.map((t) => `${t.facet}:${t.name}`).join(' · ')}` : '');
     const [renameBtn, delBtn] = li.querySelectorAll('.rowbtn');
     li.querySelector('.chatrow__text').onclick = () => selectChat(c.id);
     renameBtn.onclick = (e) => { e.stopPropagation(); startRenameChat(li, c); };
@@ -610,6 +666,14 @@ function renderChats() {
     el.chatList.appendChild(li);
   }
 }
+
+// Librarian filings land after the turn returns — refresh the affected views
+// whenever one completes (title/summary/tags on chats, tags on documents).
+window.api.onLibrarianUpdate(async (ev) => {
+  if (ev.projectId !== state.currentProjectId) return;
+  try { state.chats = await window.api.chats.list(state.currentProjectId); renderChats(); } catch {}
+  if (state.page === 'documents') renderDocumentsPage();
+});
 
 function startRenameChat(li, c) {
   const titleEl = li.querySelector('.title');
@@ -726,14 +790,65 @@ const DOC_CANON = [
   { type: 'pseudocode', sub: 'component outlines' },
   { type: 'knowledge', sub: 'contracts · gotchas · glossary' }
 ];
+// Librarian views (O31): how the GENERATED & UPLOADED list is organized.
+// 'recency' is the flat list; the rest group by doc_type or a tag facet —
+// the same documents, pivoted, because no single organization fits every
+// retrieval ("last week's work" vs "everything about acme").
+state.libraryView = 'recency';
+state.libraryTag = null;   // `${facet}:${slug}` filter, or null
+
+function tagChips(tags, { onClick } = {}) {
+  const wrap = document.createElement('span');
+  wrap.className = 'tagchips';
+  for (const t of (tags || [])) {
+    const chip = document.createElement('button');
+    chip.type = 'button';
+    chip.className = 'tagchip' + (state.libraryTag === `${t.facet}:${t.slug}` ? ' tagchip--on' : '');
+    chip.textContent = t.name;
+    chip.title = `${t.facet}: ${t.name} — click to filter the library and sessions`;
+    chip.onclick = (e) => { e.stopPropagation(); (onClick || toggleLibraryTag)(t); };
+    wrap.appendChild(chip);
+  }
+  return wrap;
+}
+function toggleLibraryTag(t) {
+  const key = `${t.facet}:${t.slug}`;
+  state.libraryTag = state.libraryTag === key ? null : key;
+  renderDocumentsPage();
+  renderChats();
+}
+const hasTag = (item, key) => (item.tags || []).some((t) => `${t.facet}:${t.slug}` === key);
+
 async function renderDocumentsPage() {
   if (!state.currentProjectId) return;
   try { state.documents = await window.api.documents.list(state.currentProjectId); } catch {}
+  try { state.libraryTags = await window.api.library.tags(state.currentProjectId); } catch { state.libraryTags = []; }
   const g = (id) => document.getElementById(id);
   const canonUl = g('docs-canonical'), otherUl = g('docs-other');
   if (!canonUl) return;
   canonUl.innerHTML = ''; otherUl.innerHTML = '';
   const canonTypes = new Set(DOC_CANON.map((c) => c.type));
+
+  // Tag filter bar — the project's whole vocabulary, grouped by facet.
+  const bar = g('library-filter');
+  if (bar) {
+    bar.innerHTML = '';
+    const used = (state.libraryTags || []).filter((t) => (t.doc_count || 0) + (t.chat_count || 0) > 0);
+    bar.hidden = used.length === 0;
+    let lastFacet = null;
+    for (const t of used) {
+      if (t.facet !== lastFacet) {
+        const lab = document.createElement('span'); lab.className = 'libfilter__facet'; lab.textContent = t.facet.toUpperCase();
+        bar.appendChild(lab); lastFacet = t.facet;
+      }
+      bar.appendChild(tagChips([t]).firstChild);
+    }
+    if (state.libraryTag) {
+      const clear = document.createElement('button'); clear.type = 'button'; clear.className = 'tagchip tagchip--clear'; clear.textContent = '✕ clear filter';
+      clear.onclick = () => { state.libraryTag = null; renderDocumentsPage(); renderChats(); };
+      bar.appendChild(clear);
+    }
+  }
 
   const row = (d, sub) => {
     const li = document.createElement('li'); li.className = 'conn';
@@ -743,11 +858,36 @@ async function renderDocumentsPage() {
       <div class="conn__info"><div class="conn__label">${escapeHtml(d.title)}</div><div class="conn__type">${escapeHtml(d.doc_type || d.source || 'doc')}</div></div>
       <div class="conn__mid"><div class="conn__url">${escapeHtml(sub || d.path || '')}</div><div class="conn__meta">v${d.version || 1}${when ? ' · ' + escapeHtml(when) : ''}</div></div>
       <div class="conn__actions"></div>`;
+    if (d.tags && d.tags.length) li.querySelector('.conn__info').appendChild(tagChips(d.tags));
     const actions = li.querySelector('.conn__actions');
     const view = document.createElement('button'); view.className = 'conn__btn'; view.textContent = 'VIEW';
     view.onclick = async () => {
       const r = await window.api.documents.read(d.id);
       if (r && r.error) { g('doc-reader-title').textContent = d.title; g('doc-reader-body').textContent = r.error; g('doc-reader').hidden = false; return; }
+      // Render by TYPE, not by hoping everything is text. A PDF opens in the
+      // panel's PDF viewer; a spreadsheet or image says what it is and offers
+      // Finder. Only actual text falls through to the markdown reader.
+      // A PDF opens in its own window. The artifact <webview> cannot render
+      // PDFs (measured: a captured frame held 9 distinct colours — blank),
+      // which is what the black screen was.
+      if (r.pdfPath && /pdf/i.test(r.mime || '')) {
+        const o = await window.api.documents.openPdf(d.id);
+        if (o && o.error) {
+          g('doc-reader-title').textContent = d.title;
+          g('doc-reader-body').textContent = o.error;
+          g('doc-reader').hidden = false;
+        }
+        return;
+      }
+      if (r.binary) {
+        const kb = Math.max(1, Math.round((r.bytes || 0) / 1024));
+        g('doc-reader-title').textContent = `${d.title} · v${d.version || 1}`;
+        g('doc-reader-body').innerHTML = `<p><b>${escapeHtml(String(r.mime || 'binary file'))}</b> · ${kb} KB</p>`
+          + '<p>There is no in-app viewer for this type yet. Use FINDER to open it in the app that owns it.</p>';
+        g('doc-reader').hidden = false;
+        g('doc-reader').scrollIntoView({ block: 'nearest' });
+        return;
+      }
       if (/html/.test(r.mime || '')) { openArtifact(r.content, d.title); return; }
       g('doc-reader-title').textContent = `${d.title} · v${d.version || 1}`;
       g('doc-reader-body').innerHTML = mdToHtml(r.content || '(empty)', []);
@@ -768,11 +908,65 @@ async function renderDocumentsPage() {
     const d = state.documents.find((x) => x.doc_type === c.type);
     if (d) canonUl.appendChild(row(d, c.sub));
   }
-  // Everything else: deliverables, uploads, user docs.
-  const others = state.documents.filter((d) => !canonTypes.has(d.doc_type));
+  // Everything else: deliverables, uploads, user docs — filtered by the
+  // selected tag, then organized per the current view.
+  let others = state.documents.filter((d) => !canonTypes.has(d.doc_type));
+  if (state.libraryTag) others = others.filter((d) => hasTag(d, state.libraryTag));
   g('docs-other-empty').hidden = others.length > 0;
-  for (const d of others) otherUl.appendChild(row(d));
+
+  const groupHeader = (label) => {
+    const h = document.createElement('li'); h.className = 'libgroup'; h.textContent = label;
+    return h;
+  };
+  if (state.libraryView === 'recency' || !others.length) {
+    for (const d of others) otherUl.appendChild(row(d));
+  } else if (state.libraryView === 'kind') {
+    const byKind = new Map();
+    for (const d of others) { const k = d.doc_type || d.source || 'other'; (byKind.get(k) || byKind.set(k, []).get(k)).push(d); }
+    for (const [k, list] of [...byKind.entries()].sort((a, b) => a[0].localeCompare(b[0]))) {
+      otherUl.appendChild(groupHeader(k.toUpperCase()));
+      for (const d of list) otherUl.appendChild(row(d));
+    }
+  } else {
+    // entity / topic: group by that facet's tags; untagged docs sink to the end.
+    const facet = state.libraryView;
+    const byTag = new Map(); const untagged = [];
+    for (const d of others) {
+      const ts = (d.tags || []).filter((t) => t.facet === facet);
+      if (!ts.length) { untagged.push(d); continue; }
+      for (const t of ts) (byTag.get(t.name) || byTag.set(t.name, []).get(t.name)).push(d);
+    }
+    for (const [name, list] of [...byTag.entries()].sort((a, b) => a[0].localeCompare(b[0]))) {
+      otherUl.appendChild(groupHeader(`${facet.toUpperCase()}: ${name}`));
+      for (const d of list) otherUl.appendChild(row(d));
+    }
+    if (untagged.length) {
+      otherUl.appendChild(groupHeader(`(no ${facet} tag)`));
+      for (const d of untagged) otherUl.appendChild(row(d));
+    }
+  }
 }
+// View switcher — one active button, re-render on change.
+document.querySelectorAll('#library-view .libview__btn').forEach((b) => {
+  b.onclick = () => {
+    state.libraryView = b.dataset.view;
+    document.querySelectorAll('#library-view .libview__btn').forEach((x) => x.classList.toggle('libview__btn--on', x === b));
+    renderDocumentsPage();
+  };
+});
+// TIDY: batch librarian pass — tags/summaries only, nothing moves on disk.
+document.getElementById('docs-tidy').onclick = async () => {
+  const btn = document.getElementById('docs-tidy');
+  if (!state.currentProjectId || btn.disabled) return;
+  btn.disabled = true; btn.textContent = '✦ TIDYING…';
+  try {
+    const r = await window.api.library.tidy({ projectId: state.currentProjectId, providerId: state.selected?.providerId, model: state.selected?.model });
+    btn.textContent = r && r.ok ? `✦ FILED ${r.documents} DOCS · ${r.chats} SESSIONS` : `✦ ${(r && r.error) || 'tidy failed'}`;
+  } catch (e) { btn.textContent = '✦ tidy failed'; }
+  setTimeout(() => { btn.textContent = '✦ TIDY LIBRARY'; btn.disabled = false; }, 4000);
+  renderDocumentsPage();
+  try { state.chats = await window.api.chats.list(state.currentProjectId); renderChats(); } catch {}
+};
 document.getElementById('docs-reveal').onclick = async () => {
   if (!state.currentProjectId) return;
   try { const eff = await window.api.projects.effectiveOutputDir(state.currentProjectId); if (eff && eff.outputDir) window.api.projects.revealPath(eff.outputDir); } catch {}
@@ -794,11 +988,27 @@ async function renderVars() {
     li.innerHTML = `<div class="title">${escapeHtml(v.key)}</div>`
       + `<div class="sub">${escapeHtml(String(v.value).slice(0, 90))} · ${escapeHtml(v.confidence || 'observed')}</div>`;
     li.title = 'Click to edit — your value outranks anything the model observed. Empty clears it.';
-    li.onclick = async () => {
-      const next = window.prompt(`${v.key}\n\nEdit the value (empty clears it):`, String(v.value));
-      if (next === null) return;
-      try { await window.api.chats.setVariable(state.currentChatId, v.key, next.trim()); } catch {}
-      renderVars();
+    // Inline editor (window.prompt does not exist in Electron): click swaps the
+    // sub line for an input; Enter saves, Escape/blur cancels.
+    li.onclick = () => {
+      if (li.querySelector('input')) return;
+      const sub = li.querySelector('.sub');
+      const input = document.createElement('input');
+      input.type = 'text'; input.className = 'raillist__edit'; input.value = String(v.value);
+      sub.replaceWith(input);
+      input.focus(); input.select();
+      let done = false;
+      const finish = async (save) => {
+        if (done) return; done = true;
+        if (save) { try { await window.api.chats.setVariable(state.currentChatId, v.key, input.value.trim()); } catch {} }
+        renderVars();
+      };
+      input.onkeydown = (e) => {
+        if (e.key === 'Enter') finish(true);
+        else if (e.key === 'Escape') finish(false);
+      };
+      input.onblur = () => finish(false);
+      input.onclick = (e) => e.stopPropagation();
     };
     list.appendChild(li);
   }
@@ -840,6 +1050,18 @@ async function setAllMcp(enabled) {
 }
 document.getElementById('ov-skills-all').onclick = () => setAllSkills(true);
 document.getElementById('ov-skills-none').onclick = () => setAllSkills(false);
+// The SKILLS page needs these too. They existed only on Overview, so anyone
+// managing skills where skills live had to toggle 30 of them one at a time.
+// Same handler; the list is re-rendered afterwards so the switches update.
+const setAllSkillsHere = async (enabled) => {
+  const msg = document.getElementById('skills-msg');
+  if (msg) { msg.textContent = enabled ? 'enabling all…' : 'disabling all…'; msg.className = 'test-result'; }
+  await setAllSkills(enabled);
+  await loadSkills();
+  if (msg) { msg.textContent = enabled ? 'all skills enabled for this project' : 'all skills disabled for this project'; setTimeout(() => { msg.textContent = ''; }, 2500); }
+};
+document.getElementById('skills-all').onclick = () => setAllSkillsHere(true);
+document.getElementById('skills-none').onclick = () => setAllSkillsHere(false);
 document.getElementById('ov-mcp-all').onclick = () => setAllMcp(true);
 document.getElementById('ov-mcp-none').onclick = () => setAllMcp(false);
 function chatModeOf(chat) {
@@ -935,16 +1157,16 @@ const CONTRIB = {
 function fmtTok(n) { return n >= 1000 ? (n / 1000).toFixed(n >= 10000 ? 0 : 1) + 'k' : String(n); }
 function fmtDur(ms) { if (ms == null) return ''; return ms >= 1000 ? (ms / 1000).toFixed(ms >= 10000 ? 0 : 1) + 's' : Math.round(ms) + 'ms'; }
 
-function captureInternals(ev) {
-  if (!state.currentChatId) return;
-  state.internals[state.currentChatId] = { ledger: ev, toolTurns: [], process: [] };
+function captureInternals(ev, chatId = state.currentChatId) {
+  if (!chatId) return;
+  state.internals[chatId] = { ledger: ev, toolTurns: [], process: [] };
   updateCtxMeter();
   if (state.page === 'internals') renderInternals();
 }
 // Sub-agent lifecycle events (delegate → runSubagent) build the thread tree.
-function captureProcess(ev) {
+function captureProcess(ev, chatId = state.currentChatId) {
   if (ev.kind === 'skill-select') return; // carried on the ledger; nothing to accumulate
-  const rec = state.internals[state.currentChatId];
+  const rec = state.internals[chatId];
   if (!rec) return;
   rec.process = rec.process || [];
   // Plan-and-execute lifecycle (execute.js/plan-derive.js) — tracked on rec.plan
@@ -988,15 +1210,15 @@ function captureProcess(ev) {
   }
   if (state.page === 'internals' && state.internalsLens === 'process') renderInternals();
 }
-function captureInternalsTools(ev) {
-  const rec = state.internals[state.currentChatId];
+function captureInternalsTools(ev, chatId = state.currentChatId) {
+  const rec = state.internals[chatId];
   if (!rec) return;
   rec.toolTurns = ev.trace || [];        // authoritative reconcile at end of turn
   if (state.page === 'internals') renderInternals();
 }
 // Live: a tool just returned mid-loop — append it (filtered) and tick occupancy.
-function captureInternalsToolEnd(ev) {
-  const rec = state.internals[state.currentChatId];
+function captureInternalsToolEnd(ev, chatId = state.currentChatId) {
+  const rec = state.internals[chatId];
   if (!rec) return;
   rec.toolTurns = rec.toolTurns || [];
   const raw = Math.ceil((ev.resultChars || 0) / 4);
@@ -1011,8 +1233,8 @@ function captureInternalsToolEnd(ev) {
   if (state.page === 'internals') renderInternals();
 }
 
-function captureMetrics(ev) {
-  const rec = state.internals[state.currentChatId];
+function captureMetrics(ev, chatId = state.currentChatId) {
+  const rec = state.internals[chatId];
   if (!rec) return;
   rec.metrics = ev;
   if (state.page === 'internals' && state.internalsLens === 'context') renderInternals();
@@ -1532,6 +1754,10 @@ async function loadProviders() {
   if (!state.selected) state.selected = await initialSelection();
   if (state.selected) el.modelLabel.textContent = state.selected.model;
   try { state.evaluatorModel = await window.api.settings.get('evaluator_model'); } catch { /* optional */ }
+  try {
+    const savedTheme = await window.api.settings.get('ui_theme');
+    if (savedTheme === 'dark' || savedTheme === 'light') { state.theme = savedTheme; applyTheme(); }
+  } catch { /* optional */ }
   buildModelMenu();
   updateComposerMeta();
 }
@@ -1739,6 +1965,10 @@ function renderAlignForm(body, ev) {
     el.input.value = parts.join('; ');
     autosize();
     form.remove();          // the markdown reply above stays as the durable record
+    // O8: this next turn IS the ratification — the user picked these answers
+    // in the align form. Only that earns `user` confidence in the store;
+    // everything else the planner infers is `derived` and stays correctable.
+    pendingAlignAnswer = true;
     submit();
   };
   const bar = document.createElement('div'); bar.className = 'alignform__bar'; bar.appendChild(go);
@@ -1747,12 +1977,27 @@ function renderAlignForm(body, ev) {
   el.messages.scrollTop = el.messages.scrollHeight;
 }
 
+// Set by the align form's submit; consumed by the very next submit() and
+// cleared immediately, so it can never leak into an unrelated later turn.
+let pendingAlignAnswer = false;
+
 async function submit() {
   if (el.send.dataset.mode === 'stop') return; // a turn is running — the button is the stop control
   const text = el.input.value.trim();
   if ((!text && !state.attachments.length) || !state.currentChatId) return;
   const missing = missingPrereqs();
   if (missing.length) { showSetupNotice(missing); return; }
+  // Turn identity, captured NOW: everything this turn saves or attributes uses
+  // these — switching chats mid-turn must never land the reply, internals, or
+  // metrics in the wrong chat. turnId scopes progress events and the
+  // abort/continue control channels to exactly this turn.
+  const turnChatId = state.currentChatId;
+  const turnProjectId = state.currentProjectId;
+  const turnId = `t${Date.now().toString(36)}${Math.floor(Math.random() * 1e6).toString(36)}`;
+  // Consume the align-ratification flag exactly once (O8).
+  const fromAlign = pendingAlignAnswer; pendingAlignAnswer = false;
+  state.turnByChat = state.turnByChat || {};
+  state.turnByChat[turnChatId] = turnId;
   const attached = state.attachments.slice();
   state.attachments = []; renderAttachChips();
   const userTurn = turn(text || '📎 (attached files)', 'user');
@@ -1764,14 +2009,14 @@ async function submit() {
   el.send.dataset.mode = 'stop';
   el.send.textContent = '⏹ STOP & SAVE';
   document.documentElement.classList.add('busy');
-  await window.api.messages.add({ chatId: state.currentChatId, role: 'user', content: text });
+  await window.api.messages.add({ chatId: turnChatId, role: 'user', content: text });
   // Keep attachments as project documents so they persist + appear in the rail.
-  if (attached.length && state.currentProjectId) {
+  if (attached.length && turnProjectId) {
     // Written to disk (not just indexed) so the coding tools can actually open
     // them, and so the paths can be handed to the planner with this turn.
     for (const a of attached) {
       try {
-        const r = await window.api.documents.saveUpload({ projectId: state.currentProjectId, name: a.name, content: a.content });
+        const r = await window.api.documents.saveUpload({ projectId: turnProjectId, name: a.name, content: a.content });
         if (r && r.path) a.path = r.path;
       } catch {}
     }
@@ -1797,7 +2042,7 @@ async function submit() {
     prompt.innerHTML = `<span class="limitprompt__msg">Reached ${iterations} tool steps without finishing — keep going?</span>`;
     const cont = document.createElement('button'); cont.className = 'btn btn--brand btn--sm'; cont.textContent = 'CONTINUE +10';
     const stop = document.createElement('button'); stop.className = 'btn btn--ghost btn--sm'; stop.textContent = 'STOP & SUMMARIZE';
-    const answer = (more) => { window.api.continueChat(more); prompt.remove(); status.textContent = more ? 'continuing…' : 'summarizing…'; };
+    const answer = (more) => { window.api.continueChat(more, turnId); prompt.remove(); status.textContent = more ? 'continuing…' : 'summarizing…'; };
     cont.onclick = () => answer(10);
     stop.onclick = () => answer(0);
     prompt.appendChild(cont); prompt.appendChild(stop);
@@ -1816,7 +2061,7 @@ async function submit() {
       + (step ? ` — blocked at: ${escapeHtml(step)}` : '') + `. Keep trying?</span>`;
     const cont = document.createElement('button'); cont.className = 'btn btn--brand btn--sm'; cont.textContent = 'KEEP TRYING';
     const stop = document.createElement('button'); stop.className = 'btn btn--ghost btn--sm'; stop.textContent = 'STOP & SUMMARIZE';
-    const answer = (more) => { window.api.continueChat(more); prompt.remove(); status.textContent = more ? 'continuing…' : 'summarizing…'; };
+    const answer = (more) => { window.api.continueChat(more, turnId); prompt.remove(); status.textContent = more ? 'continuing…' : 'summarizing…'; };
     cont.onclick = () => answer(1);
     stop.onclick = () => answer(0);
     prompt.appendChild(cont); prompt.appendChild(stop);
@@ -1837,13 +2082,13 @@ async function submit() {
       + `<code class="shellcmd">${escapeHtml(String(ev.summary || '').slice(0, 600))}</code>`;
     const allow = document.createElement('button'); allow.className = 'btn btn--brand btn--sm'; allow.textContent = 'ALLOW';
     const deny = document.createElement('button'); deny.className = 'btn btn--ghost btn--sm'; deny.textContent = 'DENY';
-    const answer = (more) => { window.api.continueChat(more); prompt.remove(); status.textContent = more ? 'continuing…' : 'action skipped…'; };
+    const answer = (more) => { window.api.continueChat(more, turnId); prompt.remove(); status.textContent = more ? 'continuing…' : 'action skipped…'; };
     allow.onclick = () => answer(1);
     deny.onclick = () => answer(0);
     prompt.appendChild(allow); prompt.appendChild(deny);
     const makeBypassBtn = () => {
-      const bypass = document.createElement('button'); bypass.className = 'btn btn--ghost btn--sm'; bypass.textContent = 'BYPASS (GIT ROLLBACK)';
-      bypass.title = 'Allow this and stop asking for this project — available because the working directory is a git repo, so changes can be rolled back';
+      const bypass = document.createElement('button'); bypass.className = 'btn btn--ghost btn--sm'; bypass.textContent = 'BYPASS SHELL PROMPTS';
+      bypass.title = 'Stop asking for this project. File changes are rolled back by git; SHELL effects (network, installs, deletes outside the repo) are NOT — the app will ask you to confirm this grant.';
       bypass.onclick = async () => { try { await window.api.settings.set('coding_bypass', '1', state.currentProjectId); } catch {} answer(1); updateBypassChip(); };
       return bypass;
     };
@@ -1877,6 +2122,7 @@ async function submit() {
   }
 
   const unsub = window.api.onChatProgress((ev) => {
+    if (ev.turnId && ev.turnId !== turnId) return; // another turn's events
     if (ev.type === 'token') {
       streamed += ev.text;
       const stick = nearBottom();
@@ -1885,29 +2131,30 @@ async function submit() {
     } else if (ev.type === 'model') { if (!streamed) status.textContent = 'thinking…'; }
     else if (ev.type === 'process' && ev.kind === 'planning') { if (!streamed) status.textContent = 'deriving plan…'; }
     else if (ev.type === 'process' && ev.kind === 'planning-done') { if (!streamed) status.textContent = ev.steps ? `plan: ${ev.steps} steps` : 'thinking…'; }
+    else if (ev.type === 'process' && ev.kind === 'retry') { status.textContent = `provider busy (${ev.status || 'error'}) — retry ${ev.attempt}…`; }
     else if (ev.type === 'tool-start') { if (!streamed) status.textContent = `running ${shortTool(ev.name)}…`; }
     else if (ev.type === 'limit') { showLimitPrompt(ev.iterations); }
     else if (ev.type === 'stuck') { showStuckPrompt(ev); }
     else if (ev.type === 'action-approve') { showActionPrompt(ev); }
     else if (ev.type === 'align-form') { alignEv = ev; }
     else if (ev.type === 'stream-reset') { streamed = ''; }  // synthesis begins — steps streamed above were working text, not the reply
-    else if (ev.type === 'internals') { captureInternals(ev); }
-    else if (ev.type === 'internals-tools') { captureInternalsTools(ev); }
-    else if (ev.type === 'tool-end') { captureInternalsToolEnd(ev); }
-    else if (ev.type === 'process') { captureProcess(ev); }
-    else if (ev.type === 'metrics') { captureMetrics(ev); }
+    else if (ev.type === 'internals') { captureInternals(ev, turnChatId); }
+    else if (ev.type === 'internals-tools') { captureInternalsTools(ev, turnChatId); }
+    else if (ev.type === 'tool-end') { captureInternalsToolEnd(ev, turnChatId); }
+    else if (ev.type === 'process') { captureProcess(ev, turnChatId); }
+    else if (ev.type === 'metrics') { captureMetrics(ev, turnChatId); }
     else if (ev.type === 'document-saved') { onDocumentSaved(ev); }
     planEvent(ev);
   });
 
   try {
-    const history = (await window.api.messages.list(state.currentChatId)).map((m) => ({ role: m.role, content: m.content }));
+    const history = (await window.api.messages.list(turnChatId)).map((m) => ({ role: m.role, content: m.content }));
     if (attached.length && history.length) {
       const block = attached.map((a) => `\n\n[Attached file: ${a.name}${a.path ? ` — saved at ${a.path}` : ''}]\n\`\`\`\n${a.content}\n\`\`\``).join('');
       const last = history[history.length - 1];
       history[history.length - 1] = { ...last, content: (last.content || '') + block };
     }
-    const res = await window.api.sendMessage({ providerId: state.selected?.providerId, model, messages: history, text, projectId: state.currentProjectId, chatId: state.currentChatId, attachments: attached.map((a) => ({ name: a.name, path: a.path || null, chars: (a.content || '').length })) });
+    const res = await window.api.sendMessage({ providerId: state.selected?.providerId, model, messages: history, text, projectId: turnProjectId, chatId: turnChatId, turnId, fromAlign, attachments: attached.map((a) => ({ name: a.name, path: a.path || null, chars: (a.content || '').length })) });
     if (res.compressed) {
       const note = document.createElement('div');
       note.className = 'turn turn--meta';
@@ -1919,13 +2166,18 @@ async function submit() {
     // streamed may hold per-step working text if stream-reset was missed.
     let finalText = ((res.planned ? res.reply : streamed) || res.reply || streamed || '(empty response)').trim();
     if (res.aborted && !res.planned) finalText += '\n\n⏹ *Stopped at your request — gathered values and tool work were saved.*';
+    // Honesty marker: a max_tokens cut must never present as a complete answer.
+    if (res.truncated) finalText += '\n\n⚠ *Response hit the output-token limit — it may be cut off. Ask to continue for the rest.*';
+    // O26: a failing check must never be invisible behind a confident reply —
+    // same honesty-marker treatment as a truncated response.
+    if (res.checkFailing) finalText += `\n\n⚠ *The project check${res.checkCommand ? ` (\`${res.checkCommand}\`)` : ''} is still failing — the finding was recorded in the DEBT ledger.*`;
     renderAssistantBody(body, finalText);
     thinking._copyText = finalText;
     if (!thinking.querySelector('.copybtn')) addCopyBtn(thinking);
     if (res.toolTrace && res.toolTrace.length) toolChips(thinking, res.toolTrace);
     if (alignEv && alignEv.decisions && alignEv.decisions.length) renderAlignForm(body, alignEv);
     el.messages.scrollTop = el.messages.scrollHeight;
-    await window.api.messages.add({ chatId: state.currentChatId, role: 'assistant', content: finalText, metadata: { model: res.model, tools: res.toolTrace || [] } });
+    await window.api.messages.add({ chatId: turnChatId, role: 'assistant', content: finalText, metadata: { model: res.model, tools: res.toolTrace || [] } });
   } catch (err) {
     thinking.className = 'turn turn--meta';
     thinking.innerHTML = `<div class="turn__body">ERROR · ${escapeHtml(err?.message ?? 'request failed')}</div>`;
@@ -2487,6 +2739,9 @@ const LEVELS = ['log', 'warn', 'error', 'debug'];
 function loadArtifact() {
   av.view.src = 'data:text/html;charset=utf-8,' + encodeURIComponent(artifactHtml);
 }
+// A PDF is a document, not a string. The panel's hardened <webview> hands the
+// bytes to Chromium's own PDF viewer — pagination, zoom and search for free,
+// no new dependency and no CSP change (frame-src already allows this panel).
 function openArtifact(html, title) {
   artifactHtml = html;
   av.title.textContent = title || 'REPORT';
@@ -2802,6 +3057,8 @@ el.agentCancel.onclick = closeAgentEditor;
 el.railTabs.querySelectorAll('.rail__tab').forEach((b) => { b.onclick = () => showRail(b.dataset.rail); });
 el.ovCheatSave.onclick = saveCheatSheet;
 document.getElementById('ov-env-save').onclick = saveBuildEnv;
+document.getElementById('ov-check-save').onclick = saveCheckCommand;
+document.getElementById('ov-drift-run').onclick = runDriftScan;
 
 el.newProjectBtn.onclick = () => { el.newProjectForm.hidden = !el.newProjectForm.hidden; if (!el.newProjectForm.hidden) el.newProjectInput.focus(); };
 el.heroNewProject.onclick = openNewProjectForm;
@@ -2828,7 +3085,7 @@ el.railAddDoc.onclick = () => { const t = el.input.value.trim() || 'Untitled'; c
 
 el.send.onclick = () => {
   if (el.send.dataset.mode === 'stop') {
-    window.api.abortChat();
+    window.api.abortChat(state.turnByChat && state.turnByChat[state.currentChatId]);
     el.send.disabled = true;            // one stop is enough; finally() re-arms it
     el.send.textContent = 'STOPPING…';
     return;

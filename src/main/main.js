@@ -61,6 +61,11 @@ function createWindow() {
     webPreferences.nodeIntegration = false;
     webPreferences.contextIsolation = true;
     webPreferences.sandbox = true;
+    // NOTE: do NOT set webPreferences.plugins here. It looks like the fix for
+    // a PDF showing black, and measurement says the opposite: with a file:
+    // URL, plugins:false renders the document (1693 distinct colours in a
+    // captured frame) and plugins:true fails the load outright with
+    // ERR_FAILED. The black screen was the data: URL, not the plugin flag.
   });
 
   win.loadFile(path.join(__dirname, '..', 'renderer', 'index.html'));
@@ -74,10 +79,16 @@ function createWindow() {
     console.log('[renderer]', msg);
   });
 
-  // Open target=_blank / window.open links in the user's real browser, never in-app.
+  // Open target=_blank / window.open links in the user's real browser, never
+  // in-app — and only web URLs: file:/custom schemes via openExternal are an
+  // execution primitive (same rule as ipc's app:openExternal).
   win.webContents.setWindowOpenHandler(({ url }) => {
-    shell.openExternal(url);
+    if (/^https?:\/\//i.test(url)) shell.openExternal(url);
     return { action: 'deny' };
+  });
+  // The app window must never navigate away from its own local file.
+  win.webContents.on('will-navigate', (e, url) => {
+    if (!url.startsWith('file://')) e.preventDefault();
   });
 
   if (isDev) win.webContents.openDevTools({ mode: 'detach' });
