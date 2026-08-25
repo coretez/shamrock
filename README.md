@@ -17,6 +17,7 @@ Built with Electron. Everything stays local on your Mac: API keys are encrypted 
 - **MCP that stays honest** — connect Model Context Protocol servers over stdio or streamable HTTP (OAuth 2.1: discovery → DCR → PKCE → refresh); **version-drift detection** badges stale imported skills and cached tool listings with one-click re-sync.
 - **Skills** — per-project skill enablement with tool scoping; author in-app or import a library from a connected MCP server.
 - **Documentation as source of truth** — each project keeps `docs/SPEC.md`, `DESIGN.md`, `PSEUDOCODE.md`, and `KNOWLEDGE.md`; the planner reads them instead of re-deriving intent from code, and the pipeline maintains them after every mutating turn.
+- **LLM firewall** — route model traffic through a [Trylon Gateway](https://github.com/trylonai/gateway) on your own machine and Shamrock acts on its verdict: a refused prompt stops the turn and shows a firewall card, not a chatbot answer. Blocked text never reaches the transcript, the audit records the decision and its correlation id and never the content, and the card says which SIDE was refused — outbound (it never left the machine) or inbound (the model answered and the answer was refused). Rulesets and setup in [`firewall/`](firewall/).
 - **Context compression** — summarizes older history as it approaches a model's context window, structurally protecting discovered values.
 - **In-place updates** — a titlebar chip announces new commits; one click pulls, refreshes dependencies, and restarts (git installs today; signed release channel on the roadmap).
 
@@ -26,9 +27,8 @@ Shamrock is a **public dev preview** — clone and run. It is built spec-first:
 [`docs/HARNESS_OBJECTIVES.md`](docs/HARNESS_OBJECTIVES.md) is the objectives
 ledger (each capability has an ID, acceptance criteria, and an honest
 SHIPPED / PARTIAL / PLANNED status). Headline roadmap items: signed
-installers with an auto-update channel, the LLM firewall + guardrails layer,
-document verification with provenance manifests, the data-bound widget
-library, and team policy via a shared proxy.
+installers with an auto-update channel, document verification with provenance
+manifests, the data-bound widget library, and team policy via a shared proxy.
 
 ## Security model
 

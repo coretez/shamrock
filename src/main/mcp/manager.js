@@ -20,57 +20,120 @@ function sanitize(s) { return String(s || '').replace(/[^a-zA-Z0-9_-]/g, '_'); }
 // and a failed selection has a bounded fallback slice.
 const MAX_TOOLS = 300;
 
+// Servers whose grant the authorization server has revoked. A refresh token
+// that has already been spent is not retryable: under rotation with replay
+// detection, presenting it AGAIN is what tells the server a token was stolen,
+// and the response is to revoke the whole family. So a dead grant is recorded
+// here and never touched again this session — the only way back is a fresh
+// interactive authorization.
+const deadGrants = new Map(); // serverId -> reason
+
+/** A refresh that must not be retried; the grant needs re-authorization. */
+function markGrantDead(serverId, error) {
+  const reason = (error && error.message) || 'refresh rejected';
+  deadGrants.set(serverId, reason);
+  console.error(`[mcp oauth] grant for server ${serverId} is DEAD (${reason}) — re-authorize; no further refresh will be attempted`);
+  try { repo.mcp.update(serverId, { status: 'error', statusDetail: `Authorization expired — reconnect this server. (${reason})` }); } catch {}
+}
+
+/** Refresh once, persist the rotated token, and classify a fatal failure. */
+async function refreshAndPersist(serverId, secret) {
+  try {
+    const refreshed = await oauth.refresh(secret.oauth);
+    secret.oauth = { ...secret.oauth, ...refreshed };
+    // Persist BEFORE the token is used: the old one is already spent, so a
+    // rotated token that never reaches disk is a grant thrown away.
+    repo.mcp.update(serverId, { secret });
+    deadGrants.delete(serverId);
+    return true;
+  } catch (e) {
+    if (oauth.isDeadGrant(e)) markGrantDead(serverId, e);
+    else console.error('[mcp oauth] refresh failed (retryable)', e && e.message);
+    return false;
+  }
+}
+
 // Return a valid bearer token for a server, refreshing an expired OAuth token
-// (and persisting the new one) when possible.
+// (and persisting the new one) when possible. Returns undefined when the token
+// is expired and could not be renewed. Handing back a KNOWN-EXPIRED token only
+// guarantees a 401, and that 401 used to trigger a SECOND refresh attempt which
+// replayed the same spent token — two replays per connect, either one enough to
+// make the authorization server revoke the grant.
 async function bearerFor(serverId, secret) {
   if (!secret.oauth || !secret.oauth.access_token) return secret.token || undefined;
   const o = secret.oauth;
   const secsLeft = o.expires_at ? Math.round((o.expires_at - Date.now()) / 1000) : null;
   console.log(`[mcp oauth] server ${serverId} — hasRefreshToken:${!!o.refresh_token} expiresInSec:${secsLeft}`);
+  const expired = o.expires_at && Date.now() > o.expires_at;
   const nearExpiry = o.expires_at && Date.now() > o.expires_at - 60000;
-  if (nearExpiry && o.refresh_token) {
-    try {
-      const refreshed = await oauth.refresh(o);
-      secret.oauth = { ...o, ...refreshed };
-      repo.mcp.update(serverId, { secret });
-    } catch (e) { console.error('[mcp oauth] refresh failed', e && e.message); }
+  if (nearExpiry && o.refresh_token && !deadGrants.has(serverId)) {
+    const ok = await refreshAndPersist(serverId, secret);
+    if (!ok && expired) return undefined;   // no point offering a dead token
+  } else if (expired && deadGrants.has(serverId)) {
+    return undefined;
   }
   return secret.oauth.access_token;
 }
 
 // Force an OAuth refresh using the stored refresh token; persist the new token.
 async function tryRefresh(serverId) {
+  if (deadGrants.has(serverId)) return false;   // never replay a spent token
   const secret = repo.mcp.reveal(serverId) || {};
   if (!secret.oauth || !secret.oauth.refresh_token) return false;
-  try {
-    const r = await oauth.refresh(secret.oauth);
-    secret.oauth = { ...secret.oauth, ...r };
-    repo.mcp.update(serverId, { secret });
-    console.log('[mcp oauth] token refreshed for server', serverId);
-    return true;
-  } catch (e) { console.error('[mcp oauth] refresh failed', e && e.message); return false; }
+  const ok = await refreshAndPersist(serverId, secret);
+  if (ok) console.log('[mcp oauth] token refreshed for server', serverId);
+  return ok;
 }
+
+/** True when a server needs a fresh interactive authorization. */
+function needsReauth(serverId) { return deadGrants.has(serverId); }
+
+// Connections being opened right now, so two callers never refresh in parallel.
+// Without this, a CONNECT click landing while a turn is starting gives both
+// callers a cache miss, both refresh, and the loser presents a token the winner
+// already spent — a self-inflicted replay that revokes the grant.
+const opening = new Map(); // serverId -> Promise<McpConnection>
 
 async function ensure(server) {
   const existing = connections.get(server.id);
   if (existing && existing.open) return existing;
+  const inFlight = opening.get(server.id);
+  if (inFlight) return inFlight;
+  const p = openConnectionFor(server).finally(() => opening.delete(server.id));
+  opening.set(server.id, p);
+  return p;
+}
+
+async function openConnectionFor(server) {
   const mk = async () => {
     const secret = repo.mcp.reveal(server.id) || {};
     const token = await bearerFor(server.id, secret); // proactively refreshes near expiry
     return new McpConnection({ transport: server.transport, command: server.command, args: server.args, url: server.url, env: secret.env, token });
   };
   let conn = await mk();
+  if (needsReauth(server.id)) throw reauthError(server);
   try {
     await conn.openConnection();
   } catch (e) {
-    // Reactive: on an auth failure, refresh the token and retry once.
+    // Reactive: on an auth failure, refresh the token and retry once. tryRefresh
+    // refuses outright once the grant is known dead, so a revoked grant produces
+    // ONE clear "re-authorize" error instead of another replay.
     if (/401|unauthor|invalid_token/i.test(e.message || '') && await tryRefresh(server.id)) {
       conn = await mk();
       await conn.openConnection();
+    } else if (needsReauth(server.id)) {
+      throw reauthError(server);
     } else throw e;
   }
   connections.set(server.id, conn);
   return conn;
+}
+
+/** The one error a revoked grant should ever produce. */
+function reauthError(server) {
+  const e = new Error(`${server.name}: authorization expired — reconnect this server to sign in again.`);
+  e.code = 'MCP_NEEDS_REAUTH';
+  return e;
 }
 
 /**
@@ -129,4 +192,4 @@ async function callTool(namespaced, args, routes) {
 
 function disposeAll() { for (const c of connections.values()) c.close(); connections.clear(); }
 
-module.exports = { buildToolset, callTool, connectAndCache, disposeAll, sanitize, MAX_TOOLS };
+module.exports = { buildToolset, callTool, connectAndCache, disposeAll, sanitize, needsReauth, MAX_TOOLS };

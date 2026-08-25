@@ -3,6 +3,7 @@
 const { ipcMain, shell, dialog, BrowserWindow } = require('electron');
 const repo = require('./db/repo');
 const { getConnector, testConnection, registryList } = require('./providers');
+const { normalizeBaseUrl, testGuard } = require('./guards');
 const { connectAndList } = require('./mcp/client');
 const mcpManager = require('./mcp/manager');
 const { runAuthFlow } = require('./mcp/oauth');
@@ -28,6 +29,36 @@ const librarian = require('./librarian');
 // measured turns before it says anything, so a new project stays quiet.
 const COST_OUTLIER_FACTOR = 3;
 const MIN_COST_HISTORY = 5;
+
+function guardedConnector(provider, providerKey, context = {}) {
+  const guard = repo.guards.active();
+  if (!guard) return getConnector(provider, providerKey);
+  const guardKey = repo.guards.reveal(guard.id);
+  if (guard.auth_mode === 'bearer' && !guardKey) throw new Error(`${guard.label || 'The enabled guard'} needs a bearer token.`);
+  return getConnector(provider, providerKey, {
+    guard, guardKey,
+    onAudit: (event) => {
+      try { return repo.guards.recordEvent({ guardId: guard.id, providerId: provider.id, ...context, ...event }); }
+      catch (error) { console.error('[guard audit]', error && error.message); }
+    }
+  });
+}
+
+/**
+ * Confirm an irreversible delete, main-side. Destroy-confirmations belong on
+ * the same wall as `coding_bypass` and `check_command`: the renderer asks, the
+ * user answers in a dialog the page cannot draw, style, or click for them.
+ * Cancel is the default button, so a stray Return keeps the data.
+ * @returns {Promise<boolean>} true only on an explicit Delete.
+ */
+async function confirmDelete({ message, detail }) {
+  const win = BrowserWindow.getFocusedWindow() || BrowserWindow.getAllWindows()[0];
+  const r = await dialog.showMessageBox(win, {
+    type: 'warning', buttons: ['Delete permanently', 'Cancel'], defaultId: 1, cancelId: 1,
+    message, detail
+  });
+  return r.response === 0;
+}
 
 /** Median of a numeric list, or 0 when there is not enough history to judge. */
 function medianOf(values) {
@@ -323,6 +354,26 @@ function registerIpc() { // (documentPathAllowed exported below for smoke covera
   ipcMain.handle('projects:create', (_e, input) => repo.projects.create(input));
   ipcMain.handle('projects:rename', (_e, { id, name }) => repo.projects.rename(id, name));
   ipcMain.handle('projects:archive', (_e, { id }) => repo.projects.archive(id));
+  ipcMain.handle('projects:unarchive', (_e, { id }) => repo.projects.unarchive(id));
+  ipcMain.handle('projects:listArchived', () => repo.projects.listArchived());
+  // Deleting a project cascades across chats, messages, documents, tags,
+  // agents, settings and credentials. Confirmed main-side with the real
+  // counts, and explicit that files on disk are NOT touched.
+  ipcMain.handle('projects:delete', async (_e, { id }) => {
+    const project = repo.projects.get(id);
+    if (!project) return { ok: false, missing: true };
+    const c = repo.projects.contents(id);
+    const ok = await confirmDelete({
+      message: `Permanently delete the project "${project.name}"?`,
+      detail: `${c.chats} chat${c.chats === 1 ? '' : 's'}, ${c.messages} message${c.messages === 1 ? '' : 's'} and `
+        + `${c.documents} library entr${c.documents === 1 ? 'y' : 'ies'} will be erased. This cannot be undone.\n\n`
+        + `The ${c.filesOnDisk} file${c.filesOnDisk === 1 ? '' : 's'} on disk are NOT deleted — they stay where they are, `
+        + 'and the app simply stops tracking them.\n\nTo hide the project without losing anything, archive it instead.'
+    });
+    if (!ok) return { ok: false, cancelled: true };
+    repo.projects.remove(id);
+    return { ok: true };
+  });
   ipcMain.handle('projects:setWorkingDir', (_e, { id, dir }) => repo.projects.setWorkingDir(id, dir));
   // Native folder picker → set the project's working directory.
   ipcMain.handle('projects:pickWorkingDir', async (_e, { id }) => {
@@ -402,7 +453,7 @@ function registerIpc() { // (documentPathAllowed exported below for smoke covera
     let row = null;
     try {
       row = repo.documents.saveGenerated({
-        projectId, title: safe, path: w.absPath, mimeType: 'text/plain',
+        projectId, title: safe, path: w.absPath, mimeType: docs.mimeForPath(w.absPath),
         source: 'upload', docType: null, version: w.version
       });
     } catch (e) { console.error('[upload index]', e && e.message); }
@@ -436,9 +487,12 @@ function registerIpc() { // (documentPathAllowed exported below for smoke covera
         if (/\.(xlsx?|docx?|pptx?|png|jpe?g|gif|zip|bin)$/i.test(d.path)) {
           return { binary: true, mime: d.mime_type || 'application/octet-stream', title: d.title, path: d.path, bytes: fs.statSync(d.path).size };
         }
-        return { content: fs.readFileSync(d.path, 'utf8'), mime: d.mime_type || 'text/plain', title: d.title };
+        // Resolve against the PATH: an upload is indexed with a hardcoded
+        // label regardless of what it is, so trusting mime_type alone showed
+        // uploaded .html as source text instead of rendering it.
+        return { content: fs.readFileSync(d.path, 'utf8'), mime: docs.mimeForPath(d.path, d.mime_type), title: d.title };
       }
-      return { content: d.content || '', mime: d.mime_type || 'text/plain', title: d.title };
+      return { content: d.content || '', mime: docs.mimeForPath(d.path, d.mime_type), title: d.title };
     } catch (e) { return { error: e.message }; }
   });
   // Open a PDF in its own hardened window. Measured 2026-08-14: the artifact
@@ -532,7 +586,7 @@ function registerIpc() { // (documentPathAllowed exported below for smoke covera
     const key = repo.providers.reveal(providerId);
     if (!key) return { error: `No API key stored for ${provider.label || provider.type}.`, findings: [] };
     try {
-      const connector = getConnector(provider, key);
+      const connector = guardedConnector(provider, key);
       return await runEvaluator({ connector, model: model || provider.default_model, digest });
     } catch (e) {
       return { error: e && e.message ? e.message : 'evaluation failed', findings: [] };
@@ -558,7 +612,7 @@ function registerIpc() { // (documentPathAllowed exported below for smoke covera
       // callback can refuse everything without ever being consulted.
       const coding = buildCodingTools({ root: project.working_dir, docsRoot: outputDir, approveAction: async () => false, projectId });
       const rb = projectDocs.readRulebook(project.working_dir);
-      const connector = getConnector(provider, key);
+      const connector = guardedConnector(provider, key);
       const scan = await driftScan({
         connector, model: model || provider.default_model, coding, root: project.working_dir,
         rulebook: rb ? rb.text : '', docsBlock: projectDocs.load(projectId, 4000)
@@ -596,6 +650,24 @@ function registerIpc() { // (documentPathAllowed exported below for smoke covera
     return store.toJSON();
   });
   ipcMain.handle('chats:archive', (_e, { id }) => repo.chats.archive(id));
+  ipcMain.handle('chats:unarchive', (_e, { id }) => repo.chats.unarchive(id));
+  ipcMain.handle('chats:listArchived', (_e, { projectId }) => repo.chats.listArchived(projectId));
+  // Permanent, and therefore confirmed MAIN-side showing what is actually
+  // lost — a renderer must not be able to destroy history on its own say-so.
+  ipcMain.handle('chats:delete', async (_e, { id }) => {
+    const chat = repo.chats.get(id);
+    if (!chat) return { ok: false, missing: true };
+    const { messages } = repo.chats.contents(id);
+    const ok = await confirmDelete({
+      message: `Permanently delete "${chat.title || 'Untitled chat'}"?`,
+      detail: `${messages} message${messages === 1 ? '' : 's'} will be erased. This cannot be undone.\n\n`
+        + 'Documents this chat produced belong to the PROJECT and are kept, on disk and in the library.\n\n'
+        + 'To keep the session and only clear it from the list, archive it instead.'
+    });
+    if (!ok) return { ok: false, cancelled: true };
+    repo.chats.remove(id);
+    return { ok: true };
+  });
   ipcMain.handle('messages:list', (_e, { chatId }) => repo.messages.listByChat(chatId));
   ipcMain.handle('messages:add', (_e, input) => repo.messages.add(input));
   ipcMain.handle('messages:rate', (_e, { id, rating }) => repo.messages.setRating(id, rating));
@@ -678,7 +750,7 @@ function registerIpc() { // (documentPathAllowed exported below for smoke covera
     const provider = providerId ? repo.providers.get(providerId) : null;
     const key = provider ? repo.providers.reveal(providerId) : null;
     if (!provider || !key) return { ok: false, error: 'no provider available for the librarian' };
-    const connector = getConnector(provider, key);
+    const connector = guardedConnector(provider, key);
     const fm = provider.fast_model || model || provider.default_model;
     const filedDocs = []; const filedChats = [];
     try {
@@ -823,6 +895,63 @@ function registerIpc() { // (documentPathAllowed exported below for smoke covera
     return result;
   });
 
+  // Downstream LLM firewall connections. An enabled guard changes where model
+  // traffic goes, so activation is confirmed in the trusted main process and
+  // names the exact endpoint. Secrets only travel renderer → main.
+  const confirmGuardEnable = async (guard) => {
+    const win = BrowserWindow.getFocusedWindow() || BrowserWindow.getAllWindows()[0];
+    const r = await dialog.showMessageBox(win, {
+      type: 'warning', buttons: ['Enable guard', 'Cancel'], defaultId: 1, cancelId: 1,
+      message: `Route supported model traffic through ${guard.label || 'this guard'}?`,
+      detail: `${guard.base_url || guard.baseUrl}\n\nPrompts, tool definitions, and model responses will pass through this endpoint. Only enable endpoints you trust.`
+    });
+    return r.response === 0;
+  };
+  ipcMain.handle('guards:list', () => repo.guards.list());
+  ipcMain.handle('guards:events', (_e, { limit = 100 } = {}) => repo.guards.events(limit));
+  ipcMain.handle('guards:add', async (_e, input = {}) => {
+    const clean = { ...input, baseUrl: normalizeBaseUrl(input.baseUrl), authMode: input.authMode === 'bearer' ? 'bearer' : 'passthrough' };
+    if (clean.kind === 'trylon') clean.authMode = 'passthrough';
+    if (clean.authMode === 'bearer' && !clean.secret) return { ok: false, error: 'A bearer token is required for this guard.' };
+    if (clean.enabled && !(await confirmGuardEnable(clean))) return { ok: false, cancelled: true };
+    return { ok: true, guard: repo.guards.add(clean) };
+  });
+  ipcMain.handle('guards:update', async (_e, { id, patch = {} }) => {
+    const current = repo.guards.get(id);
+    if (!current) return { ok: false, error: 'Guard not found' };
+    const clean = { ...patch };
+    if (clean.baseUrl !== undefined) clean.baseUrl = normalizeBaseUrl(clean.baseUrl);
+    if (clean.authMode !== undefined) clean.authMode = clean.authMode === 'bearer' ? 'bearer' : 'passthrough';
+    const effectiveKind = clean.kind || current.kind;
+    if (effectiveKind === 'trylon') clean.authMode = 'passthrough';
+    const effectiveAuth = clean.authMode || current.auth_mode;
+    if (effectiveAuth === 'bearer' && !clean.secret && !current.has_secret) return { ok: false, error: 'A bearer token is required for this guard.' };
+    if (clean.enabled === true && !current.enabled) {
+      const preview = { ...current, ...clean, base_url: clean.baseUrl || current.base_url };
+      if (!(await confirmGuardEnable({ ...preview, base_url: undefined, baseUrl: preview.base_url }))) return { ok: false, cancelled: true };
+    }
+    return { ok: true, guard: repo.guards.update(id, clean) };
+  });
+  ipcMain.handle('guards:remove', (_e, { id }) => { repo.guards.remove(id); return { ok: true }; });
+  ipcMain.handle('guards:test', async (_e, input = {}) => {
+    let guard; let secret;
+    const testsSavedConfiguration = !!input.id && input.baseUrl === undefined && input.authMode === undefined && input.secret === undefined;
+    if (input.id) {
+      const saved = repo.guards.get(input.id);
+      guard = saved;
+      if (!guard) return { ok: false, error: 'Guard not found' };
+      secret = input.secret || repo.guards.reveal(input.id);
+      if (input.baseUrl !== undefined) guard = { ...guard, base_url: normalizeBaseUrl(input.baseUrl) };
+      if (input.authMode !== undefined) guard = { ...guard, auth_mode: input.authMode === 'bearer' ? 'bearer' : 'passthrough' };
+    } else {
+      guard = { base_url: normalizeBaseUrl(input.baseUrl), auth_mode: input.authMode === 'bearer' ? 'bearer' : 'passthrough' };
+      secret = input.secret || null;
+    }
+    const result = await testGuard({ baseUrl: guard.base_url, authMode: guard.auth_mode, secret });
+    if (testsSavedConfiguration) repo.guards.update(input.id, { status: result.ok ? 'ok' : 'error', statusDetail: result.error || result.detail || null, markChecked: true });
+    return result;
+  });
+
   // MCP servers — metadata only out; env/token stay in main.
   ipcMain.handle('mcp:list', () => repo.mcp.list());
   // A stdio MCP server is an arbitrary command this app will spawn — that
@@ -961,7 +1090,6 @@ function registerIpc() { // (documentPathAllowed exported below for smoke covera
       if (!provider.enabled) throw new Error(`${provider.label || provider.type} is disabled.`);
       const key = repo.providers.reveal(providerId);
       if (!key) throw new Error(`No API key stored for ${provider.label || provider.type}.`);
-      const connector = getConnector(provider, key);
       const chosenModel = model || provider.default_model;
       const fastModel = provider.fast_model || chosenModel;
       // Turn identity: every progress event carries this id, and the control
@@ -974,6 +1102,7 @@ function registerIpc() { // (documentPathAllowed exported below for smoke covera
       const turnStart = Date.now();
       const chatId = payload?.chatId || null;
       const taskLog = []; // per-task timing/tokens (sub-agents; tools added post-loop)
+      const connector = guardedConnector(provider, key, { chatId, turnId });
 
       // STOP support (abort + save work): the renderer's STOP button fires
       // chat:abort. The signal kills the in-flight provider HTTP call, and
@@ -987,13 +1116,46 @@ function registerIpc() { // (documentPathAllowed exported below for smoke covera
       };
       ipcMain.on('chat:abort', abortListener);
       const isAborted = () => aborted;
-      const chatAbortable = (a) => connector.chat({
-        ...a,
-        signal: turnAbort.signal,
-        // Connector-level retry (429/overload/transient 5xx) surfaces in the
-        // glass box instead of looking like a silent stall.
-        onRetry: (r) => emitProgress({ type: 'process', kind: 'retry', attempt: r.attempt, status: r.status, delayMs: r.delayMs })
-      });
+      let firewallBlock = null;
+      let firewallUsage = null;
+      // A blocked turn still spent everything it spent before the block.
+      const mergeBlockedUsage = (aggregate, blocked) => {
+        if (!aggregate && !blocked) return null;
+        if (!aggregate) return blocked;
+        if (!blocked) return aggregate;
+        const add = (k) => (aggregate[k] || 0) + (blocked[k] || 0);
+        return {
+          ...aggregate,
+          inputTokens: add('inputTokens'), outputTokens: add('outputTokens'),
+          cachedTokens: add('cachedTokens'), cacheCreationTokens: add('cacheCreationTokens'),
+          calls: add('calls'), measured: !!(aggregate.measured || blocked.measured)
+        };
+      };
+      const firewallError = () => {
+        const error = new Error((firewallBlock && firewallBlock.message) || 'Model traffic was blocked by the configured guard.');
+        error.code = 'LLM_GUARD_BLOCKED';
+        error.security = firewallBlock;
+        return error;
+      };
+      const chatAbortable = async (a) => {
+        // A planner may retry a failed structured-output call. Once the guard
+        // has blocked this turn, every later model attempt is stopped here
+        // without touching the network again.
+        if (firewallBlock) throw firewallError();
+        const response = await connector.chat({
+          ...a,
+          signal: turnAbort.signal,
+          // Connector-level retry (429/overload/transient 5xx) surfaces in the
+          // glass box instead of looking like a silent stall.
+          onRetry: (r) => emitProgress({ type: 'process', kind: 'retry', attempt: r.attempt, status: r.status, delayMs: r.delayMs })
+        });
+        if (response && response.security && response.security.blocked) {
+          firewallBlock = response.security;
+          firewallUsage = response.usage || null;
+          throw firewallError();
+        }
+        return response;
+      };
 
       // One-shot user prompts (limit / stuck / action-approve): emit an event,
       // await the reply on chat:continue. Waiters are a FIFO queue — parallel
@@ -1086,17 +1248,17 @@ function registerIpc() { // (documentPathAllowed exported below for smoke covera
       // Compress older history if it nears the model's context window (uses the fast model).
       let convo = base;
       let compressed = false;
-      try {
+      if (!firewallBlock) try {
         const out = await maybeCompress({
           messages: base,
           contextWindow: contextWindowFor(chosenModel),
           summarize: async (older) => {
-            const r = await connector.chat({ model: fastModel, messages: [{ role: 'user', content: SUMMARY_PROMPT + renderForSummary(older) }], maxTokens: 700 });
+            const r = await chatAbortable({ model: fastModel, messages: [{ role: 'user', content: SUMMARY_PROMPT + renderForSummary(older) }], maxTokens: 700 });
             return r.text || '';
           }
         });
         convo = out.messages; compressed = out.compressed;
-      } catch (e) { console.error('[compress]', e && e.message); }
+      } catch (e) { if (e && e.code !== 'LLM_GUARD_BLOCKED') console.error('[compress]', e && e.message); }
 
       // Tool ceiling: enforce any declared skill tool scope over the planner's
       // picks (context-select.js's applyToolCeiling — a hard restriction the
@@ -1508,6 +1670,7 @@ function registerIpc() { // (documentPathAllowed exported below for smoke covera
       let result;
       let planInfo = null; // {steps, replans, completed} — planner telemetry (v15)
       try {
+        if (firewallBlock) throw firewallError();
         // ── Plan Pass 2 (plan-derive.js): derive the steps from the loaded
         // skills + tools + known values. Only attempted when real capabilities
         // are in play; any planner failure degrades to {simple:true}, so the
@@ -1609,6 +1772,7 @@ function registerIpc() { // (documentPathAllowed exported below for smoke covera
             new Promise((resolve) => setTimeout(() => resolve({ simple: true, goal: '', steps: [], error: 'planning timed out (240s) — fell back to the flat loop' }), 240000))
           ]);
           if (plan.error) console.warn('[plan-derive]', plan.error);
+          if (firewallBlock) throw firewallError();
           emitProgress({ type: 'process', kind: 'planning-done', durationMs: Date.now() - planT0, steps: plan.simple ? 0 : plan.steps.length, error: plan.error });
           taskLog.push({ kind: 'select', label: 'derive-plan', tokens: null, durationMs: Date.now() - planT0, ok: !plan.error });
         }
@@ -1736,7 +1900,7 @@ function registerIpc() { // (documentPathAllowed exported below for smoke covera
                 contextWindow: contextWindowFor(chosenModel),
                 protect: store.render() || undefined,
                 summarize: async (older) => {
-                  const r = await connector.chat({ model: fastModel, messages: [{ role: 'user', content: SUMMARY_PROMPT + renderForSummary(older) }], maxTokens: 700 });
+                  const r = await chatAbortable({ model: fastModel, messages: [{ role: 'user', content: SUMMARY_PROMPT + renderForSummary(older) }], maxTokens: 700 });
                   return r.text || '';
                 }
               });
@@ -1921,7 +2085,7 @@ function registerIpc() { // (documentPathAllowed exported below for smoke covera
                 contextWindow: contextWindowFor(chosenModel),
                 protect: store.render() || undefined,
                 summarize: async (older) => {
-                  const r = await connector.chat({ model: fastModel, messages: [{ role: 'user', content: SUMMARY_PROMPT + renderForSummary(older) }], maxTokens: 700 });
+                  const r = await chatAbortable({ model: fastModel, messages: [{ role: 'user', content: SUMMARY_PROMPT + renderForSummary(older) }], maxTokens: 700 });
                   return r.text || '';
                 }
               });
@@ -1972,8 +2136,31 @@ function registerIpc() { // (documentPathAllowed exported below for smoke covera
           }
         }
       } catch (e) {
-        console.error(`[chat] ${provider.type}/${chosenModel} error (${orchestratorTools.length} tools):`, e && e.message);
-        throw e;
+        if (e && e.code === 'LLM_GUARD_BLOCKED' && firewallBlock) {
+          emitProgress({ type: 'security', ...firewallBlock });
+          emitProgress({ type: 'done' });
+          // Keep the work the turn had already done. A blocked investigation
+          // that made eleven MCP calls before the guard fired still has eleven
+          // tool results worth of evidence, and the audit/metrics rows are the
+          // only place that survives — reporting toolTrace:[] and iterations:0
+          // made every block look like it happened on the first call.
+          const partial = (e.partial && typeof e.partial === 'object') ? e.partial : {};
+          result = {
+            reply: firewallBlock.message,
+            toolTrace: partial.toolTrace || [],
+            iterations: partial.iterations || 0,
+            // The AGGREGATE, plus the refused call. `firewallUsage` alone is
+            // just the blocked response — a handful of tokens — so reporting it
+            // for a turn that had already spent eleven model calls billed the
+            // user's telemetry for a fraction of what the turn actually cost.
+            usage: mergeBlockedUsage(partial.usage, firewallUsage),
+            planned: false, firewallBlocked: true, security: firewallBlock
+          };
+          planInfo = { steps: 0, replans: 0, completed: false };
+        } else {
+          console.error(`[chat] ${provider.type}/${chosenModel} error (${orchestratorTools.length} tools):`, e && e.message);
+          throw e;
+        }
       } finally {
         ipcMain.removeListener('chat:continue', promptListener);
         ipcMain.removeListener('chat:abort', abortListener);
@@ -2056,7 +2243,7 @@ function registerIpc() { // (documentPathAllowed exported below for smoke covera
       // faceted tags — AFTER the reply returns, non-blocking (one fast-model
       // call must never add latency to the turn). Completion announces itself
       // on librarian:update so the sidebar refreshes whenever it lands.
-      if (chatId && projectId && !result.aborted) {
+      if (chatId && projectId && !result.aborted && !result.firewallBlocked) {
         const sender = _e.sender;
         (async () => {
           try {
@@ -2080,7 +2267,7 @@ function registerIpc() { // (documentPathAllowed exported below for smoke covera
         })();
       }
 
-      return { model: chosenModel, reply: result.reply, provider: provider.type, toolTrace: result.toolTrace, compressed, usage: result.usage || null, planned: !!result.planned, aborted: !!result.aborted, truncated: !!result.truncated };
+      return { model: chosenModel, reply: result.reply, provider: provider.type, toolTrace: result.toolTrace, compressed, usage: result.usage || null, planned: !!result.planned, aborted: !!result.aborted, truncated: !!result.truncated, firewallBlocked: !!result.firewallBlocked, security: result.security || null };
     }
 
     // The renderer should never let a send reach here without a provider (see

@@ -1,6 +1,6 @@
 {
   "name": "agnostic-chat",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Shamrock \u2014 an LLM-agnostic desktop harness for coding, documents, and agentic work. Local-first, spec-driven.",
   "main": "src/main/main.js",
   "author": "Christopher Jordan",
@@ -10,6 +10,8 @@
     "dev": "electron . --dev",
     "smoke": "electron scripts/smoke.js",
     "eval": "electron scripts/eval.js",
+    "firewall-suite": "./scripts/firewall-suite.sh",
+    "firewall-regression": "electron scripts/firewall-regression.js",
     "test": "electron scripts/smoke.js",
     "icon": "electron scripts/make-icon.js",
     "pack": "electron-builder --mac --dir",

@@ -238,6 +238,38 @@ CREATE TABLE IF NOT EXISTS providers (
   updated_at        TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
+-- ── Downstream LLM firewall/guard connections + metadata-only audit ────────
+CREATE TABLE IF NOT EXISTS llm_guards (
+  id                INTEGER PRIMARY KEY,
+  kind              TEXT NOT NULL DEFAULT 'openai_proxy',
+  label             TEXT,
+  base_url          TEXT NOT NULL,
+  auth_mode         TEXT NOT NULL DEFAULT 'passthrough',
+  secret_ciphertext BLOB,
+  enabled           INTEGER NOT NULL DEFAULT 0,
+  status            TEXT,
+  status_detail     TEXT,
+  last_checked_at   TEXT,
+  created_at        TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at        TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS llm_guard_events (
+  id          INTEGER PRIMARY KEY,
+  guard_id    INTEGER REFERENCES llm_guards(id) ON DELETE SET NULL,
+  provider_id INTEGER REFERENCES providers(id) ON DELETE SET NULL,
+  chat_id     INTEGER REFERENCES chats(id) ON DELETE SET NULL,
+  turn_id     TEXT,
+  model       TEXT,
+  operation   TEXT NOT NULL DEFAULT 'chat',
+  decision    TEXT NOT NULL,
+  duration_ms INTEGER,
+  detail      TEXT,
+  created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_guard_events_created ON llm_guard_events(id DESC);
+CREATE INDEX IF NOT EXISTS idx_guard_events_chat ON llm_guard_events(chat_id, id DESC);
+
 -- ── MCP servers: Model Context Protocol tool servers ───────────────────────
 -- App-global. stdio (command/args/env) or http (url/token). Any secret material
 -- (env vars, bearer token) is encrypted at rest exactly like provider keys.

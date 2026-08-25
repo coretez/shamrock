@@ -64,6 +64,10 @@ contextBridge.exposeInMainWorld('api', {
     create: (input) => ipcRenderer.invoke('projects:create', input),
     rename: (id, name) => ipcRenderer.invoke('projects:rename', { id, name }),
     archive: (id) => ipcRenderer.invoke('projects:archive', { id }),
+    unarchive: (id) => ipcRenderer.invoke('projects:unarchive', { id }),
+    listArchived: () => ipcRenderer.invoke('projects:listArchived'),
+    // Permanent; main confirms before anything is removed.
+    delete: (id) => ipcRenderer.invoke('projects:delete', { id }),
     pickWorkingDir: (id) => ipcRenderer.invoke('projects:pickWorkingDir', { id }),
     revealPath: (p) => ipcRenderer.invoke('app:revealPath', p),
     setPreferredModel: (id, model) => ipcRenderer.invoke('projects:setPreferredModel', { id, model }),
@@ -110,7 +114,11 @@ contextBridge.exposeInMainWorld('api', {
     setMode: (id, mode) => ipcRenderer.invoke('chats:setMode', { id, mode }),
     variables: (id) => ipcRenderer.invoke('chats:variables', { id }),
     setVariable: (id, key, value) => ipcRenderer.invoke('chats:setVariable', { id, key, value }),
-    archive: (id) => ipcRenderer.invoke('chats:archive', { id })
+    archive: (id) => ipcRenderer.invoke('chats:archive', { id }),
+    unarchive: (id) => ipcRenderer.invoke('chats:unarchive', { id }),
+    listArchived: (projectId) => ipcRenderer.invoke('chats:listArchived', { projectId }),
+    // Permanent; main confirms before anything is removed.
+    delete: (id) => ipcRenderer.invoke('chats:delete', { id })
   },
 
   messages: {
@@ -160,6 +168,17 @@ contextBridge.exposeInMainWorld('api', {
     update: (id, patch) => ipcRenderer.invoke('providers:update', { id, patch }),
     remove: (id) => ipcRenderer.invoke('providers:remove', { id }),
     test: (input) => ipcRenderer.invoke('providers:test', input)
+  },
+
+  // Downstream LLM firewall connections. Secrets only travel into main;
+  // list/events return metadata and sanitized audit records.
+  guards: {
+    list: () => ipcRenderer.invoke('guards:list'),
+    add: (input) => ipcRenderer.invoke('guards:add', input),
+    update: (id, patch) => ipcRenderer.invoke('guards:update', { id, patch }),
+    remove: (id) => ipcRenderer.invoke('guards:remove', { id }),
+    test: (input) => ipcRenderer.invoke('guards:test', input),
+    events: (limit = 100) => ipcRenderer.invoke('guards:events', { limit })
   },
 
   // MCP servers. Metadata only out; env/token only ever sent IN.

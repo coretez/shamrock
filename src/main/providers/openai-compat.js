@@ -39,7 +39,20 @@ async function req(url, { key, method = 'GET', body, timeoutMs = 30000, signal }
       const detail = json?.error?.message || json?.message || (text ? text.slice(0, 400) : '');
       throw httpError(res.status, detail, res.headers.get('retry-after'));
     }
-    return json;
+    return {
+      json,
+      responseMeta: {
+        blocked: res.headers.get('x-trylon-blocked') === 'true',
+        // The gateway STATES which side it refused (X-Trylon-Stage). Inferring it
+        // from the response body only works on the OpenAI route and not at all on
+        // the Claude one, where input and output blocks are byte-identical.
+        stage: res.headers.get('x-trylon-stage'),
+        safetyCode: res.headers.get('x-trylon-safety-code'),
+        action: res.headers.get('x-trylon-action'),
+        message: res.headers.get('x-trylon-message'),
+        requestId: res.headers.get('x-request-id')
+      }
+    };
   } catch (err) {
     // Distinguish the user's STOP from a genuine timeout — same AbortError,
     // very different meaning.
@@ -208,7 +221,21 @@ async function streamChat(base, key, body, onDelta, signal, onRetry) {
   const assistantRaw = { role: 'assistant', content: text || null };
   if (tcArr.length) assistantRaw.tool_calls = tcArr;
   const toolCalls = tcArr.map((tc) => ({ id: tc.id, name: tc.function?.name, args: safeJson(tc.function?.arguments) }));
-  return { text, toolCalls, assistantRaw, usage: normalizeUsage(usage), finishReason, truncated: finishReason === 'length' };
+  return {
+    text, toolCalls, assistantRaw, usage: normalizeUsage(usage), finishReason,
+    truncated: finishReason === 'length',
+    guardMeta: {
+      blocked: res.headers.get('x-trylon-blocked') === 'true',
+      // The gateway STATES which side it refused (X-Trylon-Stage). Inferring it
+      // from the response body only works on the OpenAI route and not at all on
+      // the Claude one, where input and output blocks are byte-identical.
+      stage: res.headers.get('x-trylon-stage'),
+      safetyCode: res.headers.get('x-trylon-safety-code'),
+      action: res.headers.get('x-trylon-action'),
+      message: res.headers.get('x-trylon-message'),
+      requestId: res.headers.get('x-request-id')
+    }
+  };
 }
 
 /**
@@ -218,7 +245,7 @@ function openaiCompat({ baseUrl, key }) {
   const base = trimSlash(baseUrl);
   return {
     async listModels() {
-      const json = await req(`${base}/models`, { key, timeoutMs: 15000 });
+      const { json } = await req(`${base}/models`, { key, timeoutMs: 15000 });
       const data = Array.isArray(json?.data) ? json.data : [];
       return data.map((m) => m.id).filter(Boolean).filter(isLikelyChatModel).sort();
     },
@@ -237,11 +264,11 @@ function openaiCompat({ baseUrl, key }) {
       }
       if (!onDelta) {
         // Non-streaming path (used for test pings + compression summaries).
-        const json = await withRetry(() => req(`${base}/chat/completions`, { key, method: 'POST', body, timeoutMs: 300000, signal }), { retries: 3, signal, onRetry });
+        const { json, responseMeta } = await withRetry(() => req(`${base}/chat/completions`, { key, method: 'POST', body, timeoutMs: 300000, signal }), { retries: 3, signal, onRetry });
         const choice = json?.choices?.[0] || {};
         const msg = choice.message || {};
         const toolCalls = (msg.tool_calls || []).map((tc) => ({ id: tc.id, name: tc.function?.name, args: safeJson(tc.function?.arguments) }));
-        return { text: msg.content || '', toolCalls, assistantRaw: msg, raw: json, usage: normalizeUsage(json.usage), finishReason: choice.finish_reason || null, truncated: choice.finish_reason === 'length' };
+        return { text: msg.content || '', toolCalls, assistantRaw: msg, raw: json, usage: normalizeUsage(json.usage), finishReason: choice.finish_reason || null, truncated: choice.finish_reason === 'length', guardMeta: responseMeta };
       }
       return streamChat(base, key, body, onDelta, signal, onRetry);
     }

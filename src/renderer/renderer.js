@@ -14,6 +14,8 @@ const el = {
   ovFastDd: $('ov-fast-dd'), ovFastBtn: $('ov-fast-btn'), ovFastLabel: $('ov-fast-label'), ovFastMenu: $('ov-fast-menu'),
   themeBtn: $('theme-btn'), paletteBtn: $('palette-btn'), modelsBtn: $('models-btn'),
   projectList: $('project-list'), chatList: $('chat-list'),
+  projectsHead: $('projects-head'), chatsHead: $('chats-head'),
+  projectsArchiveBtn: $('projects-archive-btn'), chatsArchiveBtn: $('chats-archive-btn'),
   newProjectBtn: $('new-project-btn'), newProjectForm: $('new-project-form'), newProjectInput: $('new-project-input'),
   ovName: $('ov-name'), ovWdPath: $('ov-wd-path'), ovWdChange: $('ov-wd-change'), ovWdReveal: $('ov-wd-reveal'),
   ovOutPath: $('ov-out-path'), ovOutChange: $('ov-out-change'), ovOutReveal: $('ov-out-reveal'),
@@ -45,6 +47,10 @@ const el = {
   connAdd: $('conn-add'), connTest: $('conn-test'), testResult: $('test-result'),
   connCancel: $('conn-cancel'), connSave: $('conn-save'), modelsDone: $('models-done'),
   modelsHelp: $('models-help'), keyHelp: $('key-help'),
+  guardList: $('guard-list'), guardEmpty: $('guard-empty'), guardEditor: $('guard-editor'), guardEditorTitle: $('guard-editor-title'),
+  guardAdd: $('guard-add'), guardTest: $('guard-test'), guardResult: $('guard-result'), guardCancel: $('guard-cancel'), guardSave: $('guard-save'), guardRefresh: $('guard-refresh'),
+  gLabel: $('g-label'), gKind: $('g-kind'), gBaseurl: $('g-baseurl'), gAuth: $('g-auth'), gTokenField: $('g-token-field'), gToken: $('g-token'), gTokenHint: $('g-token-hint'),
+  guardStats: $('guard-stats'), guardEvents: $('guard-events'), guardEventsEmpty: $('guard-events-empty'),
   help: $('help'), helpTitle: $('help-title'), helpBody: $('help-body'), helpClose: $('help-close'),
   // MCP
   mcpBtn: $('mcp-btn'),
@@ -81,6 +87,7 @@ const state = {
   internalsLens: 'context', // 'context' | 'process' | 'review'
   evaluatorModel: null,     // model id used by the meta-evaluator
   registry: [], providers: [], showAllModels: false,
+  guards: [], guardEvents: [], guardEditing: null,
   skillsAll: [], skillsEnabledIds: new Set(), skillEditing: null, skillsSource: null,
   agents: [], agentEditing: null,
   mcpServers: [], mcpEditing: null, mcpTransport: 'stdio', mcpTools: null,
@@ -110,6 +117,7 @@ const PAGE_NOTES = {
   internals: () => 'LAST TURN · READ-ONLY',
   agents: () => `${state.agents.length} AGENT${state.agents.length === 1 ? '' : 'S'}`,
   documents: () => `${state.documents.length} DOCUMENTS`,
+  guards: () => state.guards.some((g) => g.enabled) ? 'FIREWALL ON' : 'FIREWALL OFF',
   models: () => `${state.providers.length} CONNECTIONS`
 };
 
@@ -369,6 +377,7 @@ function showPage(page) {
   if (page === 'overview') renderOverview();
   if (page === 'internals') renderInternals();
   if (page === 'documents') renderDocumentsPage();
+  if (page === 'guards') loadGuards();
 }
 function showFirstRun() {
   el.tabbar.hidden = true;
@@ -381,16 +390,84 @@ function showRail(name) {
   document.querySelectorAll('.rail__panel').forEach((p) => { p.hidden = p.dataset.rail !== name; });
 }
 
+// ── Archive ───────────────────────────────────────────────────────
+// Archiving is only useful if there is a way back, so each list can show what
+// left it, in place. Two distinct actions, never one button wearing two names:
+// ↓ archives (reversible, silent), ✕ deletes (permanent, confirmed by main).
+state.showArchived = { projects: false, chats: false };
+state.archived = { projects: [], chats: [] };
+
+async function loadArchived(which) {
+  if (which === 'projects') state.archived.projects = await window.api.projects.listArchived();
+  else state.archived.chats = state.currentProjectId ? await window.api.chats.listArchived(state.currentProjectId) : [];
+}
+async function toggleArchiveView(which) {
+  state.showArchived[which] = !state.showArchived[which];
+  if (state.showArchived[which]) await loadArchived(which);
+  if (which === 'projects') renderProjects(); else renderChats();
+}
+/** Refresh whichever archive lists are currently on screen. */
+async function refreshOpenArchives() {
+  if (state.showArchived.projects) await loadArchived('projects');
+  if (state.showArchived.chats) await loadArchived('chats');
+}
+function rowButton(glyph, title, cls, onClick) {
+  const b = document.createElement('button');
+  b.type = 'button';
+  b.className = 'rowbtn' + (cls ? ' ' + cls : '');
+  b.textContent = glyph;
+  b.title = title;
+  b.onclick = (e) => { e.stopPropagation(); onClick(); };
+  return b;
+}
+function emptyRow(text) {
+  const li = document.createElement('li');
+  li.className = 'list__empty';
+  li.textContent = text;
+  return li;
+}
+el.projectsArchiveBtn.onclick = () => toggleArchiveView('projects');
+el.chatsArchiveBtn.onclick = () => toggleArchiveView('chats');
+
 // ── Rendering: sidebar/chat ───────────────────────────────────────
 function renderProjects() {
+  const arch = state.showArchived.projects;
   el.projectList.innerHTML = '';
-  for (const p of state.projects) {
-    const li = document.createElement('li');
-    li.className = 'list__item' + (p.id === state.currentProjectId ? ' is-selected' : '');
-    li.textContent = p.name;
-    li.onclick = () => selectProject(p.id);
-    el.projectList.appendChild(li);
+  el.projectsHead.textContent = arch ? 'PROJECTS · ARCHIVED' : 'PROJECTS';
+  el.projectsArchiveBtn.classList.toggle('is-on', arch);
+  el.projectsArchiveBtn.title = arch ? 'Back to active projects' : 'Show archived projects';
+  const rows = arch ? state.archived.projects : state.projects;
+  if (!rows.length) {
+    el.projectList.appendChild(emptyRow(arch ? 'No archived projects.' : 'No projects yet.'));
+    return;
   }
+  for (const p of rows) el.projectList.appendChild(arch ? archivedProjectRow(p) : projectRow(p));
+}
+
+function projectRow(p) {
+  const li = document.createElement('li');
+  li.className = 'list__item' + (p.id === state.currentProjectId ? ' is-selected' : '');
+  li.innerHTML = '<div class="chatrow"><div class="chatrow__text"><div class="title"></div></div>'
+    + '<div class="chatrow__actions"></div></div>';
+  li.querySelector('.title').textContent = p.name;
+  li.querySelector('.chatrow__text').onclick = () => selectProject(p.id);
+  const actions = li.querySelector('.chatrow__actions');
+  actions.appendChild(rowButton('↓', 'Archive project', '', () => archiveProject(p)));
+  actions.appendChild(rowButton('✕', 'Delete project permanently', 'rowbtn--danger', () => deleteProject(p)));
+  return li;
+}
+
+function archivedProjectRow(p) {
+  const li = document.createElement('li');
+  li.className = 'list__item list__item--arch';
+  li.innerHTML = '<div class="chatrow"><div class="chatrow__text"><div class="title"></div><div class="sub"></div></div>'
+    + '<div class="chatrow__actions"></div></div>';
+  li.querySelector('.title').textContent = p.name;
+  li.querySelector('.sub').textContent = 'archived ' + (p.archived_at || '').slice(0, 16);
+  const actions = li.querySelector('.chatrow__actions');
+  actions.appendChild(rowButton('↑', 'Restore project', 'rowbtn--restore', () => restoreProject(p)));
+  actions.appendChild(rowButton('✕', 'Delete project permanently', 'rowbtn--danger', () => deleteProject(p)));
+  return li;
 }
 function renderOverview() {
   const p = state.projects.find((x) => x.id === state.currentProjectId);
@@ -647,24 +724,45 @@ async function setFastModel(providerId, model) {
 }
 
 function renderChats() {
+  const arch = state.showArchived.chats;
   el.chatList.innerHTML = '';
+  el.chatsHead.textContent = arch ? 'CHATS · ARCHIVED' : 'CHATS';
+  el.chatsArchiveBtn.classList.toggle('is-on', arch);
+  el.chatsArchiveBtn.title = arch ? 'Back to active chats' : 'Show archived chats';
   // The librarian's cross-cutting view: an active library tag filters the
   // session list too — "everything about acme", chats and documents alike.
-  const chats = state.libraryTag ? state.chats.filter((c) => hasTag(c, state.libraryTag)) : state.chats;
-  for (const c of chats) {
-    const li = document.createElement('li');
-    li.className = 'list__item list__item--chat' + (c.id === state.currentChatId ? ' is-selected' : '');
-    // The one-line summary (librarian) beats the model name as the subtitle —
-    // it says what the session IS, which is what you scan the list for.
-    const sub = c.summary || (c.model || 'no model').toLowerCase();
-    li.innerHTML = `<div class="chatrow"><div class="chatrow__text"><div class="title">${escapeHtml(c.title || 'Untitled chat')}</div><div class="sub">${escapeHtml(sub)}</div></div><div class="chatrow__actions"><button class="rowbtn" title="Rename">✎</button><button class="rowbtn" title="Delete">✕</button></div></div>`;
-    if (c.summary) li.title = c.summary + ((c.tags || []).length ? `\n${c.tags.map((t) => `${t.facet}:${t.name}`).join(' · ')}` : '');
-    const [renameBtn, delBtn] = li.querySelectorAll('.rowbtn');
-    li.querySelector('.chatrow__text').onclick = () => selectChat(c.id);
-    renameBtn.onclick = (e) => { e.stopPropagation(); startRenameChat(li, c); };
-    delBtn.onclick = (e) => { e.stopPropagation(); archiveChat(c); };
-    el.chatList.appendChild(li);
-  }
+  const pool = arch ? state.archived.chats : state.chats;
+  const chats = state.libraryTag ? pool.filter((c) => hasTag(c, state.libraryTag)) : pool;
+  if (!chats.length && arch) return void el.chatList.appendChild(emptyRow('No archived chats.'));
+  for (const c of chats) el.chatList.appendChild(arch ? archivedChatRow(c) : chatRow(c));
+}
+
+/** The one-line summary (librarian) beats the model name as the subtitle — it
+ *  says what the session IS, which is what you scan the list for. */
+function chatRow(c) {
+  const li = document.createElement('li');
+  li.className = 'list__item list__item--chat' + (c.id === state.currentChatId ? ' is-selected' : '');
+  const sub = c.summary || (c.model || 'no model').toLowerCase();
+  li.innerHTML = `<div class="chatrow"><div class="chatrow__text"><div class="title">${escapeHtml(c.title || 'Untitled chat')}</div><div class="sub">${escapeHtml(sub)}</div></div><div class="chatrow__actions"></div></div>`;
+  if (c.summary) li.title = c.summary + ((c.tags || []).length ? `\n${c.tags.map((t) => `${t.facet}:${t.name}`).join(' · ')}` : '');
+  li.querySelector('.chatrow__text').onclick = () => selectChat(c.id);
+  const actions = li.querySelector('.chatrow__actions');
+  actions.appendChild(rowButton('✎', 'Rename', '', () => startRenameChat(li, c)));
+  actions.appendChild(rowButton('↓', 'Archive chat', '', () => archiveChat(c)));
+  actions.appendChild(rowButton('✕', 'Delete chat permanently', 'rowbtn--danger', () => deleteChat(c)));
+  return li;
+}
+
+function archivedChatRow(c) {
+  const li = document.createElement('li');
+  li.className = 'list__item list__item--chat list__item--arch';
+  const when = 'archived ' + (c.archived_at || '').slice(0, 16);
+  li.innerHTML = `<div class="chatrow"><div class="chatrow__text"><div class="title">${escapeHtml(c.title || 'Untitled chat')}</div><div class="sub">${escapeHtml(when)}</div></div><div class="chatrow__actions"></div></div>`;
+  if (c.summary) li.title = c.summary;
+  const actions = li.querySelector('.chatrow__actions');
+  actions.appendChild(rowButton('↑', 'Restore chat', 'rowbtn--restore', () => restoreChat(c)));
+  actions.appendChild(rowButton('✕', 'Delete chat permanently', 'rowbtn--danger', () => deleteChat(c)));
+  return li;
 }
 
 // Librarian filings land after the turn returns — refresh the affected views
@@ -696,12 +794,31 @@ function startRenameChat(li, c) {
 
 async function archiveChat(c) {
   await window.api.chats.archive(c.id);
+  await afterChatRemoved(c.id);
+}
+async function restoreChat(c) {
+  await window.api.chats.unarchive(c.id);
+  await loadArchived('chats');
   state.chats = await window.api.chats.list(state.currentProjectId);
   renderChats();
-  if (state.currentChatId === c.id) {
-    if (state.chats.length) selectChat(state.chats[0].id);
-    else { state.currentChatId = null; el.messages.innerHTML = ''; turn('NO CHATS YET · HIT + NEXT TO CHATS', 'meta'); el.send.disabled = true; }
-  }
+  selectChat(c.id);
+}
+async function deleteChat(c) {
+  const r = await window.api.chats.delete(c.id);   // main confirms; may cancel
+  if (!r || !r.ok) return;
+  await afterChatRemoved(c.id);
+}
+/** The list lost a chat. Only re-point the transcript if it was the open one. */
+async function afterChatRemoved(id) {
+  await refreshOpenArchives();
+  state.chats = await window.api.chats.list(state.currentProjectId);
+  renderChats();
+  if (state.currentChatId !== id) return;
+  if (state.chats.length) return void selectChat(state.chats[0].id);
+  state.currentChatId = null;
+  el.messages.innerHTML = '';
+  turn('NO CHATS YET · HIT + NEXT TO CHATS', 'meta');
+  el.send.disabled = true;
 }
 // A generated document just landed on disk — refresh the project's doc list.
 async function onDocumentSaved(ev) {
@@ -795,7 +912,99 @@ const DOC_CANON = [
 // the same documents, pivoted, because no single organization fits every
 // retrieval ("last week's work" vs "everything about acme").
 state.libraryView = 'recency';
-state.libraryTag = null;   // `${facet}:${slug}` filter, or null
+state.libraryTag = null;   // `${facet}:${slug}` — kept so session filtering still works
+
+// Two libraries answering two different questions: "what does the planner
+// read?" and "what has this project produced?". They are never consulted
+// together, so showing both at once only costs the reader the scroll.
+state.docTab = 'canonical';
+function setDocTab(tab) {
+  state.docTab = tab;
+  for (const p of document.querySelectorAll('.docpane')) p.hidden = p.dataset.doctab !== tab;
+  for (const b of document.querySelectorAll('.doctab')) b.classList.toggle('doctab--on', b.dataset.doctab === tab);
+}
+function setDocTabCount(tab, n) {
+  const el = document.getElementById(`doctab-n-${tab}`);
+  if (el) el.textContent = String(n);
+}
+document.querySelectorAll('.doctab').forEach((b) => { b.onclick = () => setDocTab(b.dataset.doctab); });
+
+// ── Faceted navigation (DESIGN_SPEC §15) ────────────────────────────────────
+// A single active tag is a FILTER. Facets are multi-dimensional and combinable
+// (AND across dimensions, OR within one), and every value carries a count
+// computed against the OTHER dimensions' selections — so the shape of the
+// library is legible before you click, and a path to zero results is dimmed
+// rather than offered.
+state.facets = { kind: new Set(), tenant: new Set(), produced: new Set(), topic: new Set() };
+
+const FACET_DIMS = [
+  { key: 'kind', label: 'Kind' },
+  { key: 'tenant', label: 'Tenant' },
+  { key: 'produced', label: 'Produced' },
+  { key: 'topic', label: 'Topic' }
+];
+// Relative windows, not calendar quarters: people ask for "last 30 days", and
+// "2026-Q2" only means something if you already know today's date.
+const PRODUCED_BUCKETS = [
+  { key: 'last 7 days', days: 7 },
+  { key: 'last 30 days', days: 30 },
+  { key: 'last 90 days', days: 90 },
+  { key: 'this year', days: 365 },
+  { key: 'older', days: Infinity }
+];
+
+/** Tenant, tolerating the key drift save_document's own schema invites. */
+const docTenant = (d) => {
+  const p = d.properties || {};
+  return p.tenant || p.customer || p.company || null;
+};
+const producedBucket = (d) => {
+  const t = Date.parse(d.created_at || d.updated_at || '');
+  if (!Number.isFinite(t)) return null;
+  const days = (Date.now() - t) / 86400000;
+  return (PRODUCED_BUCKETS.find((b) => days <= b.days) || PRODUCED_BUCKETS[PRODUCED_BUCKETS.length - 1]).key;
+};
+/** Every value a document carries in one dimension (a doc can hold several topics). */
+function facetValues(d, dim) {
+  if (dim === 'kind') return [d.doc_type || d.source || 'other'];
+  if (dim === 'tenant') return [docTenant(d)].filter(Boolean);
+  if (dim === 'produced') return [producedBucket(d)].filter(Boolean);
+  return (d.tags || []).filter((t) => t.facet === 'topic' || t.facet === 'entity').map((t) => t.name);
+}
+/** AND across dimensions, OR within one. `skip` leaves a dimension unapplied so
+ *  its own counts show what selecting each value WOULD yield. */
+function matchesFacets(d, skip) {
+  return FACET_DIMS.every(({ key }) => {
+    const sel = state.facets[key];
+    if (key === skip || !sel.size) return true;
+    return facetValues(d, key).some((v) => sel.has(v));
+  });
+}
+function facetCounts(docs, dim) {
+  const counts = new Map();
+  for (const d of docs.filter((x) => matchesFacets(x, dim))) {
+    for (const v of facetValues(d, dim)) counts.set(v, (counts.get(v) || 0) + 1);
+  }
+  // Values already selected must stay visible even at zero, or they cannot be undone.
+  for (const v of state.facets[dim]) if (!counts.has(v)) counts.set(v, 0);
+  return [...counts.entries()].sort((a, b) => b[1] - a[1] || String(a[0]).localeCompare(String(b[0])));
+}
+function toggleFacet(dim, value) {
+  const sel = state.facets[dim];
+  sel.has(value) ? sel.delete(value) : sel.add(value);
+  // Sessions filter alongside documents on a shared topic/entity (O31).
+  if (dim === 'topic') {
+    const t = (state.libraryTags || []).find((x) => x.name === value && (x.facet === 'topic' || x.facet === 'entity'));
+    state.libraryTag = (t && sel.has(value)) ? `${t.facet}:${t.slug}` : null;
+    renderChats();
+  }
+  renderDocumentsPage();
+}
+const clearFacets = () => {
+  for (const { key } of FACET_DIMS) state.facets[key].clear();
+  state.libraryTag = null;
+  renderDocumentsPage(); renderChats();
+};
 
 function tagChips(tags, { onClick } = {}) {
   const wrap = document.createElement('span');
@@ -904,14 +1113,20 @@ async function renderDocumentsPage() {
   };
 
   // Canonical docs in their designed order, with their role as the subtitle.
+  let canonCount = 0;
   for (const c of DOC_CANON) {
     const d = state.documents.find((x) => x.doc_type === c.type);
-    if (d) canonUl.appendChild(row(d, c.sub));
+    if (d) { canonUl.appendChild(row(d, c.sub)); canonCount += 1; }
   }
+  setDocTabCount('canonical', canonCount);
   // Everything else: deliverables, uploads, user docs — filtered by the
   // selected tag, then organized per the current view.
-  let others = state.documents.filter((d) => !canonTypes.has(d.doc_type));
-  if (state.libraryTag) others = others.filter((d) => hasTag(d, state.libraryTag));
+  const pool = state.documents.filter((d) => !canonTypes.has(d.doc_type));
+  setDocTabCount('library', pool.length);
+  setDocTab(state.docTab);
+  renderFacetRail(pool);
+  renderFacetChips(pool);
+  const others = pool.filter((d) => matchesFacets(d));
   g('docs-other-empty').hidden = others.length > 0;
 
   const groupHeader = (label) => {
@@ -946,6 +1161,64 @@ async function renderDocumentsPage() {
     }
   }
 }
+/** The facet rail: every dimension, every value, with live counts. */
+function renderFacetRail(pool) {
+  const rail = document.getElementById('library-facets');
+  if (!rail) return;
+  rail.innerHTML = '';
+  for (const { key, label } of FACET_DIMS) {
+    const values = facetCounts(pool, key);
+    if (!values.length) continue;
+    const box = document.createElement('div'); box.className = 'facet';
+    const head = document.createElement('div'); head.className = 'facet__h';
+    head.innerHTML = `<span class="facet__lbl">${escapeHtml(label)}</span>`;
+    if (state.facets[key].size) {
+      const clr = document.createElement('button');
+      clr.type = 'button'; clr.className = 'facet__clr'; clr.textContent = 'clear';
+      clr.onclick = () => { state.facets[key].clear(); if (key === 'topic') { state.libraryTag = null; renderChats(); } renderDocumentsPage(); };
+      head.appendChild(clr);
+    }
+    box.appendChild(head);
+    for (const [value, n] of values) {
+      const on = state.facets[key].has(value);
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.className = 'fv' + (on ? ' fv--on' : '') + (!n && !on ? ' fv--zero' : '');
+      b.innerHTML = `<i class="fv__box"></i><span class="fv__v">${escapeHtml(String(value))}</span><span class="fv__n">${n}</span>`;
+      b.title = `${label}: ${value} — ${n} document${n === 1 ? '' : 's'}`;
+      b.onclick = () => toggleFacet(key, value);
+      box.appendChild(b);
+    }
+    rail.appendChild(box);
+  }
+}
+
+/** Active selections as removable chips, plus the honest "N of M". */
+function renderFacetChips(pool) {
+  const bar = document.getElementById('library-chips');
+  if (!bar) return;
+  bar.innerHTML = '';
+  const active = FACET_DIMS.flatMap(({ key }) => [...state.facets[key]].map((v) => ({ key, v })));
+  bar.hidden = !active.length;
+  for (const { key, v } of active) {
+    const c = document.createElement('button');
+    c.type = 'button'; c.className = 'libchip';
+    c.innerHTML = `${escapeHtml(key)}: ${escapeHtml(String(v))} <span class="libchip__x">×</span>`;
+    c.onclick = () => toggleFacet(key, v);
+    bar.appendChild(c);
+  }
+  if (active.length) {
+    const n = pool.filter((d) => matchesFacets(d)).length;
+    const count = document.createElement('span');
+    count.className = 'libcount'; count.textContent = `${n} of ${pool.length} documents`;
+    bar.appendChild(count);
+    const clr = document.createElement('button');
+    clr.type = 'button'; clr.className = 'libclear'; clr.textContent = 'clear all';
+    clr.onclick = clearFacets;
+    bar.appendChild(clr);
+  }
+}
+
 // View switcher — one active button, re-render on change.
 document.querySelectorAll('#library-view .libview__btn').forEach((b) => {
   b.onclick = () => {
@@ -1643,6 +1916,43 @@ function turn(text, role, model) {
   el.messages.scrollTop = el.messages.scrollHeight;
   return div;
 }
+
+function renderSecurityCard(div, security = {}, editablePrompt = '') {
+  const outbound = security.direction === 'outbound';
+  const inbound = security.direction === 'inbound';
+  const title = outbound
+    ? 'LLM FIREWALL · OUTBOUND PROMPT BLOCKED'
+    : inbound ? 'GATE GUARD · MODEL RESPONSE WITHHELD' : 'MODEL TRAFFIC BLOCKED';
+  const explanation = outbound
+    ? 'Protected or sensitive information was detected. This prompt was not sent to the upstream model.'
+    : inbound ? 'The model produced a response, but the Gate Guard withheld it before it reached you.'
+      : 'The configured guard stopped this turn. No blocked content was used by Shamrock.';
+  div.className = 'turn turn--security';
+  div.innerHTML = `<div class="security-card">
+    <div class="security-card__icon">◆</div>
+    <div class="security-card__content">
+      <div class="security-card__title">${escapeHtml(title)}</div>
+      <div class="security-card__explanation">${escapeHtml(explanation)}</div>
+      <div class="security-card__reason">${escapeHtml(security.message || 'Blocked by the configured guard.')}</div>
+      <div class="security-card__meta">${[
+        security.safetyCode ? `SAFETY CODE ${security.safetyCode}` : '',
+        security.requestId ? `REQUEST ${security.requestId}` : '',
+        security.guardLabel || ''
+      ].filter(Boolean).map(escapeHtml).join(' · ')}</div>
+      <div class="security-card__actions"></div>
+    </div>
+  </div>`;
+  const actions = div.querySelector('.security-card__actions');
+  if (outbound && editablePrompt) {
+    const edit = document.createElement('button'); edit.type = 'button'; edit.className = 'btn btn--brand btn--sm'; edit.textContent = 'EDIT PROMPT';
+    edit.onclick = () => { el.input.value = editablePrompt; autosize(); el.input.focus(); };
+    actions.appendChild(edit);
+  }
+  const audit = document.createElement('button'); audit.type = 'button'; audit.className = 'btn btn--ghost btn--sm'; audit.textContent = 'VIEW AUDIT';
+  audit.onclick = () => showPage('guards'); actions.appendChild(audit);
+  el.messages.scrollTop = el.messages.scrollHeight;
+  return div;
+}
 // Claude-style action row at the BOTTOM of each assistant reply:
 // copy · thumbs up · thumbs down · retry. Ratings persist on the message row
 // (O14: user judgment lands beside the turn's metrics).
@@ -1734,8 +2044,15 @@ function attachChipsOnTurn(turnEl, attached) {
 function renderMessages(messages) {
   el.messages.innerHTML = '';
   if (messages.length === 0) { turn('NEW CHAT · MESSAGES SAVED TO THIS PROJECT', 'meta'); return; }
+  let lastUserPrompt = '';
   for (const m of messages) {
     let meta = null; try { meta = m.metadata ? JSON.parse(m.metadata) : null; } catch {}
+    if (m.role === 'user') lastUserPrompt = m.content || '';
+    if (meta && meta.security && meta.security.blocked) {
+      const t = document.createElement('div'); el.messages.appendChild(t);
+      renderSecurityCard(t, meta.security, lastUserPrompt);
+      continue;
+    }
     const t = turn(m.content, m.role === 'user' ? 'user' : 'assistant', meta && meta.model);
     if (m.role !== 'user') {
       t._messageId = m.id;
@@ -1776,6 +2093,36 @@ async function loadProjects() {
   renderProjects();
 }
 
+// ── Project archive / delete ──────────────────────────────────────
+async function archiveProject(p) {
+  await window.api.projects.archive(p.id);
+  await afterProjectRemoved(p.id);
+}
+async function restoreProject(p) {
+  await window.api.projects.unarchive(p.id);
+  await loadArchived('projects');
+  await loadProjects();
+  selectProject(p.id);          // restoring is an act of returning to it
+}
+async function deleteProject(p) {
+  const r = await window.api.projects.delete(p.id);   // main confirms; may cancel
+  if (!r || !r.ok) return;
+  await afterProjectRemoved(p.id);
+}
+/** The list lost a project. If it was the open one, land somewhere valid
+ *  rather than leaving the UI pointed at an id that no longer resolves. */
+async function afterProjectRemoved(id) {
+  await refreshOpenArchives();
+  await loadProjects();
+  if (state.currentProjectId !== id) return;
+  state.currentProjectId = null;
+  if (state.projects.length) return void selectProject(state.projects[0].id);
+  state.currentChatId = null;
+  state.chats = [];
+  renderChats();
+  showFirstRun();
+}
+
 async function selectProject(id) {
   state.currentProjectId = id;
   state.currentChatId = null;
@@ -1786,6 +2133,9 @@ async function selectProject(id) {
   renderProjects();
 
   state.chats = await window.api.chats.list(id);
+  // The chat archive is per-project: without this it would keep showing the
+  // previous project's archived sessions under the new project's name.
+  if (state.showArchived.chats) await loadArchived('chats');
   // Bootstrap the canonical doc set (SPEC/DESIGN/PSEUDOCODE/KNOWLEDGE) so the
   // DOCUMENTS tab always shows the project's documentation structure.
   try { await window.api.documents.ensureCanonical(id); } catch {}
@@ -2148,13 +2498,36 @@ async function submit() {
   });
 
   try {
-    const history = (await window.api.messages.list(turnChatId)).map((m) => ({ role: m.role, content: m.content }));
+    const storedMessages = await window.api.messages.list(turnChatId);
+    const history = [];
+    for (const m of storedMessages) {
+      let meta = null; try { meta = m.metadata ? JSON.parse(m.metadata) : null; } catch {}
+      if (meta && meta.security && meta.security.blocked) {
+        // A blocked turn is a local control-plane event, not model history.
+        // Remove its preceding user prompt so a later turn cannot silently
+        // resend content the firewall already refused.
+        if (history.length && history[history.length - 1].role === 'user') history.pop();
+        continue;
+      }
+      history.push({ role: m.role, content: m.content });
+    }
     if (attached.length && history.length) {
       const block = attached.map((a) => `\n\n[Attached file: ${a.name}${a.path ? ` — saved at ${a.path}` : ''}]\n\`\`\`\n${a.content}\n\`\`\``).join('');
       const last = history[history.length - 1];
       history[history.length - 1] = { ...last, content: (last.content || '') + block };
     }
     const res = await window.api.sendMessage({ providerId: state.selected?.providerId, model, messages: history, text, projectId: turnProjectId, chatId: turnChatId, turnId, fromAlign, attachments: attached.map((a) => ({ name: a.name, path: a.path || null, chars: (a.content || '').length })) });
+    if (res.security && res.security.blocked) {
+      clearTimeout(_streamPending);
+      renderSecurityCard(thinking, res.security, text);
+      const content = res.security.direction === 'outbound'
+        ? 'Outbound prompt blocked by the LLM Firewall before reaching the model.'
+        : res.security.direction === 'inbound'
+          ? 'Model response withheld by the Gate Guard.'
+          : 'Model traffic blocked by the configured guard.';
+      await window.api.messages.add({ chatId: turnChatId, role: 'system', content, metadata: { model: res.model, security: res.security } });
+      return;
+    }
     if (res.compressed) {
       const note = document.createElement('div');
       note.className = 'turn turn--meta';
@@ -2249,7 +2622,90 @@ function planEvent(ev) {
   }
 }
 
-// ── Models screen ─────────────────────────────────────────────────
+// ── LLM guards screen ─────────────────────────────────────────────
+async function loadGuards() {
+  try { [state.guards, state.guardEvents] = await Promise.all([window.api.guards.list(), window.api.guards.events(100)]); }
+  catch (error) { console.error('[guards load]', error && error.message); state.guards = []; state.guardEvents = []; }
+  renderGuards(); renderGuardEvents();
+}
+
+function renderGuards() {
+  el.guardList.innerHTML = ''; el.guardEmpty.hidden = state.guards.length > 0;
+  for (const guard of state.guards) {
+    const li = document.createElement('li'); li.className = 'conn';
+    const statusCls = guard.status === 'ok' ? ' conn__status--ok' : guard.status === 'error' ? ' conn__status--error' : '';
+    const needsToken = guard.auth_mode === 'bearer' && !guard.has_secret;
+    li.innerHTML = `<span class="conn__status${statusCls}" title="${escapeHtml(guard.status_detail || guard.status || 'untested')}"></span>
+      <div class="conn__info"><div class="conn__label">${escapeHtml(guard.label || 'LLM guard')}${needsToken ? ' <span class="conn__nokey">NO TOKEN</span>' : ''}</div><div class="conn__type">${escapeHtml(guard.kind)} · ${guard.auth_mode === 'bearer' ? 'GUARD TOKEN' : 'PROVIDER KEY PASSTHROUGH'}</div></div>
+      <div class="conn__mid"><div class="conn__url">${escapeHtml(guard.base_url)}</div><div class="conn__model">${guard.enabled ? 'ACTIVE · model traffic is routed here' : 'OFF · provider traffic is direct'}</div></div><div class="conn__actions"></div>`;
+    const actions = li.querySelector('.conn__actions');
+    const toggle = document.createElement('button'); toggle.className = 'toggle' + (guard.enabled ? ' is-on' : ''); toggle.innerHTML = '<div class="toggle__knob"></div>'; toggle.title = guard.enabled ? 'Turn guard off' : 'Turn guard on';
+    toggle.onclick = async () => { const r = await window.api.guards.update(guard.id, { enabled: !guard.enabled }); if (r && r.ok) await loadGuards(); };
+    actions.appendChild(toggle);
+    const test = document.createElement('button'); test.className = 'conn__btn'; test.textContent = 'TEST';
+    test.onclick = async () => { test.textContent = '…'; const r = await window.api.guards.test({ id: guard.id }); test.textContent = r.ok ? 'OK' : 'FAIL'; await loadGuards(); };
+    actions.appendChild(test);
+    const edit = document.createElement('button'); edit.className = 'conn__btn'; edit.textContent = 'EDIT'; edit.onclick = () => openGuardEditor(guard.id); actions.appendChild(edit);
+    const remove = document.createElement('button'); remove.className = 'conn__btn conn__btn--danger'; remove.textContent = 'REMOVE'; remove.onclick = async () => { await window.api.guards.remove(guard.id); await loadGuards(); }; actions.appendChild(remove);
+    el.guardList.appendChild(li);
+  }
+}
+
+function renderGuardEvents() {
+  const events = state.guardEvents || []; el.guardEvents.innerHTML = '';
+  el.guardEventsEmpty.hidden = events.length > 0; el.guardEvents.hidden = events.length === 0;
+  const count = (decision) => events.filter((e) => e.decision === decision).length;
+  const durations = events.map((e) => Number(e.duration_ms)).filter(Number.isFinite);
+  const avg = durations.length ? Math.round(durations.reduce((a, b) => a + b, 0) / durations.length) : 0;
+  el.guardStats.innerHTML = [[events.length, 'CALLS SHOWN'], [count('allowed'), 'ALLOWED'], [count('blocked'), 'BLOCKED'], [avg ? `${avg}ms` : '—', 'AVG LATENCY']]
+    .map(([n, label]) => `<div class="guard-stat"><div class="guard-stat__n">${n}</div><div class="guard-stat__label">${label}</div></div>`).join('');
+  for (const event of events) {
+    const li = document.createElement('li'); li.className = 'guard-event';
+    const when = event.created_at ? new Date(String(event.created_at).replace(' ', 'T') + 'Z').toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '—';
+    li.innerHTML = `<span class="guard-event__time">${escapeHtml(when)}</span><span class="guard-event__decision guard-event__decision--${escapeHtml(event.decision)}">${escapeHtml(event.decision)}</span><span class="guard-event__detail" title="${escapeHtml(event.detail || '')}">${escapeHtml(event.model || event.operation)}${event.detail ? ' · ' + escapeHtml(event.detail) : ''}</span><span class="guard-event__latency">${event.duration_ms == null ? '—' : `${event.duration_ms}ms`}</span>`;
+    el.guardEvents.appendChild(li);
+  }
+}
+
+function syncGuardAuthField() {
+  const isTrylon = el.gKind.value === 'trylon';
+  if (isTrylon) el.gAuth.value = 'passthrough';
+  el.gAuth.disabled = isTrylon;
+  el.gTokenField.hidden = el.gAuth.value !== 'bearer';
+}
+function openGuardEditor(id) {
+  state.guardEditing = id || null; el.guardResult.textContent = ''; el.guardResult.className = 'test-result';
+  const guard = id ? state.guards.find((g) => g.id === id) : null;
+  el.guardEditorTitle.textContent = guard ? 'EDIT GUARD' : 'ADD GUARD';
+  el.gLabel.value = guard ? (guard.label || '') : 'Local Trylon'; el.gKind.value = guard ? guard.kind : 'trylon';
+  el.gBaseurl.value = guard ? guard.base_url : 'http://127.0.0.1:8000/v1'; el.gAuth.value = guard ? guard.auth_mode : 'passthrough';
+  el.gToken.value = ''; el.gToken.placeholder = guard && guard.has_secret ? 'leave blank to keep current token' : 'paste token';
+  syncGuardAuthField(); el.guardEditor.hidden = false;
+}
+function closeGuardEditor() { state.guardEditing = null; el.guardEditor.hidden = true; }
+async function testGuardEditor() {
+  const input = { baseUrl: el.gBaseurl.value.trim(), authMode: el.gAuth.value, secret: el.gToken.value || undefined };
+  if (state.guardEditing && !el.gToken.value) input.id = state.guardEditing;
+  el.guardResult.textContent = 'testing…'; el.guardResult.className = 'test-result';
+  try {
+    const result = await window.api.guards.test(input);
+    el.guardResult.textContent = result.ok ? `ok · ${result.detail || 'reachable'}` : (result.error || 'failed');
+    el.guardResult.className = 'test-result ' + (result.ok ? 'test-result--ok' : 'test-result--error');
+    if (state.guardEditing) await loadGuards();
+  } catch (error) { el.guardResult.textContent = error.message || 'failed'; el.guardResult.className = 'test-result test-result--error'; }
+}
+async function saveGuardEditor() {
+  const input = { label: el.gLabel.value.trim() || 'LLM guard', kind: el.gKind.value, baseUrl: el.gBaseurl.value.trim(), authMode: el.gAuth.value };
+  if (el.gToken.value) input.secret = el.gToken.value;
+  if (!input.baseUrl) { el.guardResult.textContent = 'enter a base URL'; el.guardResult.className = 'test-result test-result--error'; return; }
+  if (input.authMode === 'bearer' && !input.secret && !state.guards.find((g) => g.id === state.guardEditing && g.has_secret)) { el.guardResult.textContent = 'enter a guard token'; el.guardResult.className = 'test-result test-result--error'; return; }
+  try {
+    const result = state.guardEditing ? await window.api.guards.update(state.guardEditing, input) : await window.api.guards.add(input);
+    if (!result || !result.ok) { if (result && result.cancelled) return; throw new Error((result && result.error) || 'save failed'); }
+    closeGuardEditor(); await loadGuards();
+  } catch (error) { el.guardResult.textContent = error.message || 'save failed'; el.guardResult.className = 'test-result test-result--error'; }
+}
+
 function showModels() {
   el.pages.querySelectorAll('.page').forEach((s) => { s.hidden = s.dataset.page !== 'models'; });
   el.tabbar.querySelectorAll('.tab').forEach((b) => b.classList.remove('is-active'));
@@ -3003,6 +3459,13 @@ function openNewProjectForm() { el.newProjectForm.hidden = false; el.newProjectI
 el.themeBtn.onclick = toggleTheme;
 el.modelsBtn.onclick = showModels;
 el.mcpBtn.onclick = showMcp;
+el.guardAdd.onclick = () => openGuardEditor(null);
+el.guardCancel.onclick = closeGuardEditor;
+el.guardTest.onclick = testGuardEditor;
+el.guardSave.onclick = saveGuardEditor;
+el.guardRefresh.onclick = loadGuards;
+el.gAuth.onchange = syncGuardAuthField;
+el.gKind.onchange = syncGuardAuthField;
 el.mcpAdd.onclick = () => openMcpEditor(null);
 el.mcpDone.onclick = leaveMcp;
 el.mcpCancel.onclick = closeMcpEditor;
@@ -3139,6 +3602,7 @@ window.addEventListener('keydown', (e) => {
 (async function init() {
   applyTheme();
   await loadProviders();
+  await loadGuards();
   await loadMcp();
   await loadSkills();
   await loadProjects();

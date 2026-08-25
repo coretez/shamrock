@@ -345,7 +345,221 @@ on/off · model-specific chat rows · light/dark for all pages.
 5. **Overview (continuity)** — Index/Handoff/Tasks/Inbox, auto-maintained.
 6. **Skills page + Command Palette** — per-project toggles; ⌘K navigation.
 
-## 14. Open decisions
+## 14. Routines (O33) — interface design
+
+There is no surface for this today: nine pages, four chat rails, nothing that
+mentions a schedule. The backend design was written first, so this section
+exists to keep the UI from being retrofitted onto it.
+
+**The governing idea: capture happens where the work happened.** A routine is
+not authored from a blank form — it is a plan that already ran and worked.
+Asking someone to re-describe in a builder what they just watched succeed is
+how these features end up unused.
+
+### 14.1 Capture — the PLAN rail
+The right rail already narrates the live plan. When a turn completes
+successfully, its plan header gains **SAVE AS ROUTINE**. That is the entire
+capture affordance, and it sits three inches from the steps that just ran.
+
+Clicking opens a small sheet, pre-filled from the turn rather than empty:
+- **Name** — defaulted from the goal ("Expo monthly security report")
+- **Runs** — a plain-language schedule (`monthly on the 1st at 01:00`), not a
+  cron string; cron is the storage format, never the input
+- **Bindings** — the period-like values the plan used, each with what they
+  should become on the next run: `period 2026-07 → previous month`. This is the
+  one genuinely new concept, so it gets the most explanation and a worked
+  example of the next three fire dates.
+- **On failure** — notify / notify and disable
+
+Nothing is inferred. O8's lesson applies directly: durability is a decision the
+user makes, never one the system guesses.
+
+### 14.2 ROUTINES — a top-level page
+Routines are first-class objects with history, like documents and skills, and
+history needs room a card cannot give. Sits after AGENTS in the tab bar.
+
+Each row: name · what it produces · schedule in words · **next fire** · last
+outcome as a status dot (ran / failed / skipped / disabled) · an enable toggle.
+Selecting a row opens a detail pane with the captured plan **read-only** (the
+same step list the PLAN rail draws, so it is recognisably the thing that ran),
+the bindings with their next resolved values, and the run history.
+
+Run history is the part that earns the page: one line per fire — when, outcome,
+duration, the document produced (deep-linked into DOCUMENTS), or the reason it
+did not run. `skipped` states its cause in words: *"Fluency Expo was
+unauthorized — no document was produced."* A routine that quietly stops
+producing is the worst failure mode, so a gap in the series is drawn as a gap,
+not as an absence of rows.
+
+### 14.3 Where failure surfaces
+A 01:00 failure must be visible at 09:00 without hunting:
+- the **ROUTINES tab label** carries a count badge when any routine is in a
+  failed state
+- **OVERVIEW** gains one line in the project header — next fire, or the failure
+  if there is one
+- the outcome is written to the O27 debt ledger like any other finding
+
+No modal, no notification centre popup. The badge persists until the run
+succeeds or the routine is disabled — failures should not be dismissible by
+acknowledgement, only by resolution.
+
+### 14.4 What this deliberately does not have
+No visual schedule builder, no calendar grid, no dependency graph between
+routines, no per-step editing of a captured plan. Editing a captured plan in a
+GUI recreates the planner badly; if the plan is wrong, run the turn again and
+capture the better one — the capture is cheap, which is the whole point.
+
+## 15. Document library — retrieval strategy
+
+Today the library defaults to a recency list with single-tag pivots
+(`state.libraryView`, `state.libraryTag`). That is fine for "what did I just
+make" and answers nothing else. Recency is the one ordering guaranteed to
+decay: the document you need at month-end is the one from *last* month, and by
+definition it has been pushed down by everything since.
+
+**Start from the questions, not the layout.** A user of this library asks:
+*what is the latest Expo monthly report* · *did August actually run* ·
+*everything for Expo* · *what did we produce this quarter* · *where is that
+thing about the Falcon sensors* · *what needs my attention*. A recency list
+answers only the first, and only for a few days.
+
+### 15.1 Facets, not a filter
+What ships is a *filter* — one `facet:slug` at a time. Faceted navigation is
+multi-dimensional and combinable, and each value carries a **count reflecting
+the current result set**, so the interface shows the shape of the library
+before you commit to a click and never offers a path to zero results. NN/g puts
+task completion 25–50% faster with facets than keyword search alone, and the
+facets must be domain-specific to earn that: here **tenant · period · type ·
+status · topic**, which is exactly the vocabulary O31's librarian already
+assigns. The data exists; the navigation does not.
+
+Text search sits alongside, not instead: faceted search is text over the
+unstructured part and facets over the structured part. Neither alone is enough.
+
+### 15.2 Series are first-class objects
+A monthly report is not a document, it is the August member of a series. This
+is the largest retrieval gap and the one the current design cannot express at
+all. A series row shows its members as a **period strip** — one cell per period,
+filled where a document exists and **empty where it does not**. A missing month
+is drawn as a gap.
+
+This matters more once routines (O33) run unattended: the failure mode of a
+scheduled report is not a loud error, it is a month that quietly never appears.
+The library is where that becomes visible, and a gap in a strip is noticed in a
+way an absent row never is. Requires O23's period-as-identity split — until
+periods are identities rather than versions, a series cannot be enumerated.
+
+### 15.3 Saved views are library objects
+A view someone returns to weekly ("Expo monthlies", "unreviewed this quarter")
+should be a thing in the library, not a filter state to reconstruct each time.
+Treating a saved query as a first-class library object is a well-worn document-
+management pattern, and it is what turns facets from a search tool into
+navigation. Saved views appear beside documents in the sidebar; the default
+landing view is itself one, so it can be changed rather than hard-coded.
+
+### 15.4 The default view answers, it does not list
+Landing on the library should show, in order: **series with their period
+strips** (including gaps), **anything needing attention** (a failed routine, an
+unreviewed deliverable, a superseded document still referenced), and only then
+recent items. Recency drops to a section — it is a genuine answer to one
+question, not the organising principle.
+
+### 15.4b Two libraries, one at a time
+The DOCUMENTS page holds two collections that answer different questions:
+**PROJECT DOCUMENTATION** — the canonical set the planner itself reads
+(OBJECTIVES, DESIGN, DEBT, CODING RULES) — and **GENERATED & UPLOADED**, what
+this project has produced or been given. They are never consulted together:
+one is the standing contract, the other is output. Stacking them charged the
+reader a scroll past four fixed rows to reach the list that actually changes,
+and put the facet rail — which only ever applies to the second — alongside the
+first, where it means nothing. They are therefore **tabs**, each carrying its
+count so the shape of both is legible without switching. Canonical opens first:
+it is the smaller, fixed set, and it is what a reader arriving cold needs to
+orient. The chosen tab survives a re-render, so a document saved mid-session
+does not throw the reader back to the default.
+
+### 15.5 Two view modes, chosen by content
+List for browsing; **timeline** for periodic content, where the x-axis is the
+period and the eye reads coverage and gaps directly. Time-oriented and
+content-oriented views over the same set is standard in document management,
+and a periodic series is the case that most rewards it. No thumbnail grid —
+these are reports, not images, and a wall of identical page-one previews
+carries no information.
+
+### 15.5b Two different times, and only one of them is a facet
+The first cut showed a Period facet listing `2026-Q3 · 2026-Q2 · 2026-Q1 ·
+2025`, which conflated two unrelated things:
+
+- **What the document is ABOUT** — the July report covers July. This is
+  intrinsic, comes from the save contract, and is *already drawn better by the
+  series strip*, one cell per period, in the series' own cadence. It does not
+  need to be a facet at all; the strip shows coverage and gaps, which a list of
+  quarter buckets cannot.
+- **When it was PRODUCED** — this is what browsing actually wants, and people
+  do not ask for it in quarters. They ask for **last 7 days · last 30 · last
+  90 · this year · older**. Calendar quarters are a *reporting* convention
+  borrowed into navigation, where they fit badly: "2026-Q2" requires knowing
+  today's date to be useful, "last 30 days" does not.
+
+So: the strip owns *about*, a relative-window facet owns *made*. A quarterly
+artifact still shows quarters — in its own strip, because that is its cadence,
+not because the library imposes quarters on everything.
+
+### 15.6 No status facet — it implies a process that does not exist
+The first cut showed `reviewed / unreviewed / superseded`. Nothing sets those,
+and more importantly nothing *could* without inventing a review workflow this
+product does not have and has not asked for. A facet that describes a process
+nobody performs is worse than no facet: it invites the user to filter by a
+state that never changes.
+
+What remains real is **attention**, and it is derived from facts rather than a
+taxonomy — a routine that did not run, a document whose figures carry no as-of
+time. Those come from the run record and from provenance (O21), both of which
+are actual signals, not labels somebody was supposed to maintain.
+`superseded` is likewise derivable if it is ever wanted — a newer version or
+period exists — and should be computed, never stored as a status.
+
+### 15.7 Where the metadata comes from — the user mostly does not type it
+Facets are worthless if someone has to hand-tag 42 documents, so the honest
+answer to "how does `kind: monthly-report` get set" is **three sources, and the
+user is the last of them**:
+
+1. **The skill's save contract — the bulk, and zero user input.** A skill
+   declares its output shape once, in frontmatter, and every run fills it:
+   `expo-monthly-report` carries `type: monthly-report`,
+   `properties: {tenant: expo, period: "{YYYY-MM}"}`. The July run produced
+   `{"tenant":"expo","period":"2026-07"}` from exactly that. Whoever writes the
+   skill sets the metadata for every document it will ever produce.
+2. **The librarian (O31) fills the gaps** — a dropped-in PDF or an ad-hoc save
+   has no contract, so it gets tagged on save under deterministic validation
+   (known facets, slug dedupe, existing spellings win).
+3. **The user corrects** — in the reader, on a document that is wrong. Not
+   built (O31 lists it as an extension) and it is genuinely needed: today a
+   mis-tag is permanent. Correction is the workflow, authoring is not.
+
+**Typed `kind:monthly-report` is an accelerator, not the entry path.** The
+search box should parse `key:value` into the same facet state a click produces,
+because people who know the vocabulary type faster than they click — but
+nobody should have to learn a query language to browse, and the rail must
+always be able to answer the question on its own.
+
+**The gap this exposes: `properties` is free-form.** The tool schema invites
+drift in its own description — *"tenant/company, period/date… whatever
+applies"* — so two skills will name the same concept `tenant` and `customer`,
+and the facet rail will show both as separate dimensions. Values should stay
+open (any tenant name), but **keys need a controlled vocabulary**: `tenant`,
+`period`, `case_id`, `framework`, with unknown keys kept on the document and
+excluded from the facet rail until promoted. Same shape as the O8 durable-key
+allowlist, and for the same reason — an open key space fills with synonyms.
+
+### 15.8 What this does not do
+No folder tree in the UI. Placement (O23) organises the *disk* so files are
+portable and greppable; the interface navigates by facet, and a tree in both
+places means two organisations to keep in sync and a user asking which one is
+authoritative. No manual tagging as the primary path — the librarian tags on
+save; hand-editing is a correction, not the workflow.
+
+## 16. Open decisions
 - Model roster/versions to display (prototype shows Opus/Sonnet **4.5**, GPT-4o,
   Local Llama 3.3; align to whatever we actually call at runtime).
 - Provider set at launch (Anthropic + OpenAI + Ollama shown).

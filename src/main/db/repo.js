@@ -42,6 +42,35 @@ const projects = {
       .prepare("UPDATE projects SET archived_at = datetime('now') WHERE id = ?")
       .run(id);
   },
+  // Archiving must be undoable or it is just a slow delete. updated_at is left
+  // alone: restoring a project is not working in it, and bumping it would
+  // reorder the list under the user for no reason.
+  unarchive(id) {
+    getDb().prepare('UPDATE projects SET archived_at = NULL WHERE id = ?').run(id);
+    return projects.get(id);
+  },
+  listArchived() {
+    return getDb()
+      .prepare('SELECT * FROM projects WHERE archived_at IS NOT NULL ORDER BY archived_at DESC')
+      .all();
+  },
+  /** What a delete would take with it. Counted from the same rows the FK
+   *  cascade removes, so the confirmation cannot understate the damage. */
+  contents(id) {
+    const n = (sql) => getDb().prepare(sql).get(id).n;
+    return {
+      chats: n('SELECT COUNT(*) n FROM chats WHERE project_id = ?'),
+      documents: n('SELECT COUNT(*) n FROM documents WHERE project_id = ?'),
+      messages: n('SELECT COUNT(*) n FROM messages WHERE chat_id IN (SELECT id FROM chats WHERE project_id = ?)'),
+      filesOnDisk: n("SELECT COUNT(*) n FROM documents WHERE project_id = ? AND path IS NOT NULL AND path <> ''")
+    };
+  },
+  /** Permanent. Chats, messages, document ROWS, tags, agents, settings and
+   *  credentials go with it via ON DELETE CASCADE. Files on disk do NOT —
+   *  deleting a database row must never reach outside the database. */
+  remove(id) {
+    getDb().prepare('DELETE FROM projects WHERE id = ?').run(id);
+  },
   setWorkingDir(id, dir) {
     getDb()
       .prepare("UPDATE projects SET working_dir = ?, updated_at = datetime('now') WHERE id = ?")
@@ -204,6 +233,26 @@ const chats = {
   },
   archive(id) {
     getDb().prepare("UPDATE chats SET archived_at = datetime('now') WHERE id = ?").run(id);
+  },
+  // Restore. updated_at untouched for the same reason as projects: bringing a
+  // session back is not working in it.
+  unarchive(id) {
+    getDb().prepare('UPDATE chats SET archived_at = NULL WHERE id = ?').run(id);
+    return chats.get(id);
+  },
+  listArchived(projectId) {
+    return getDb()
+      .prepare('SELECT * FROM chats WHERE project_id = ? AND archived_at IS NOT NULL ORDER BY archived_at DESC')
+      .all(projectId);
+  },
+  /** Messages lost if this chat is deleted. Documents are PROJECT-scoped and
+   *  survive — only the chat_documents link goes. */
+  contents(id) {
+    const n = (sql) => getDb().prepare(sql).get(id).n;
+    return { messages: n('SELECT COUNT(*) n FROM messages WHERE chat_id = ?') };
+  },
+  remove(id) {
+    getDb().prepare('DELETE FROM chats WHERE id = ?').run(id);
   },
   // Variable store (working memory) persistence — opaque JSON snapshot; the
   // VariableStore class owns its shape. NULL until a turn captures something.
@@ -544,6 +593,69 @@ const providers = {
   }
 };
 
+// ── Downstream LLM guards (encrypted token + metadata-only audit) ─────────
+const GUARD_COLS =
+  'id, kind, label, base_url, auth_mode, enabled, status, status_detail, last_checked_at, created_at, updated_at, (secret_ciphertext IS NOT NULL) AS has_secret';
+
+function shapeGuard(row) {
+  return row ? { ...row, enabled: !!row.enabled, has_secret: !!row.has_secret } : row;
+}
+
+const guards = {
+  list() {
+    return getDb().prepare(`SELECT ${GUARD_COLS} FROM llm_guards ORDER BY created_at ASC`).all().map(shapeGuard);
+  },
+  get(id) {
+    return shapeGuard(getDb().prepare(`SELECT ${GUARD_COLS} FROM llm_guards WHERE id = ?`).get(id));
+  },
+  active() {
+    return shapeGuard(getDb().prepare(`SELECT ${GUARD_COLS} FROM llm_guards WHERE enabled = 1 ORDER BY updated_at DESC, id DESC LIMIT 1`).get());
+  },
+  add({ kind = 'openai_proxy', label = null, baseUrl, authMode = 'passthrough', secret = null, enabled = false }) {
+    const db = getDb();
+    if (!baseUrl) throw new Error('Guard base URL is required');
+    if (enabled) db.prepare("UPDATE llm_guards SET enabled = 0, updated_at = datetime('now') WHERE enabled = 1").run();
+    const ciphertext = secret ? secrets.encrypt(secret) : null;
+    const info = db.prepare(
+      'INSERT INTO llm_guards (kind, label, base_url, auth_mode, secret_ciphertext, enabled) VALUES (?, ?, ?, ?, ?, ?)'
+    ).run(kind, label, baseUrl, authMode, ciphertext, enabled ? 1 : 0);
+    return guards.get(info.lastInsertRowid);
+  },
+  update(id, patch = {}) {
+    const db = getDb();
+    if (patch.enabled === true) db.prepare("UPDATE llm_guards SET enabled = 0, updated_at = datetime('now') WHERE enabled = 1 AND id != ?").run(id);
+    const sets = []; const vals = [];
+    const map = { kind: 'kind', label: 'label', baseUrl: 'base_url', authMode: 'auth_mode', status: 'status', statusDetail: 'status_detail' };
+    for (const [key, col] of Object.entries(map)) {
+      if (patch[key] !== undefined) { sets.push(`${col} = ?`); vals.push(patch[key]); }
+    }
+    if (patch.enabled !== undefined) { sets.push('enabled = ?'); vals.push(patch.enabled ? 1 : 0); }
+    if (patch.secret !== undefined && patch.secret) { sets.push('secret_ciphertext = ?'); vals.push(secrets.encrypt(patch.secret)); }
+    if (patch.markChecked) sets.push("last_checked_at = datetime('now')");
+    sets.push("updated_at = datetime('now')"); vals.push(id);
+    db.prepare(`UPDATE llm_guards SET ${sets.join(', ')} WHERE id = ?`).run(...vals);
+    return guards.get(id);
+  },
+  remove(id) { getDb().prepare('DELETE FROM llm_guards WHERE id = ?').run(id); },
+  reveal(id) {
+    const row = getDb().prepare('SELECT secret_ciphertext FROM llm_guards WHERE id = ?').get(id);
+    return row && row.secret_ciphertext ? secrets.decrypt(row.secret_ciphertext) : null;
+  },
+  recordEvent({ guardId, providerId = null, chatId = null, turnId = null, model = null, operation = 'chat', decision, durationMs = null, detail = null }) {
+    return Number(getDb().prepare(
+      'INSERT INTO llm_guard_events (guard_id, provider_id, chat_id, turn_id, model, operation, decision, duration_ms, detail) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'
+    ).run(guardId || null, providerId, chatId, turnId, model, operation, decision, durationMs, detail ? String(detail).slice(0, 500) : null).lastInsertRowid);
+  },
+  events(limit = 100) {
+    const n = Math.max(1, Math.min(500, Number(limit) || 100));
+    return getDb().prepare(
+      `SELECT e.*, COALESCE(g.label, 'Removed guard') AS guard_label, p.label AS provider_label
+       FROM llm_guard_events e LEFT JOIN llm_guards g ON g.id = e.guard_id LEFT JOIN providers p ON p.id = e.provider_id
+       ORDER BY e.id DESC LIMIT ?`
+    ).all(n);
+  }
+};
+
 // ── MCP servers (encrypted env/token at rest) ──────────────────────────────
 const MCP_COLS =
   'id, name, transport, command, args_json, url, enabled, tools_json, status, status_detail, last_checked_at, created_at, updated_at, (secret_ciphertext IS NOT NULL) AS has_secret';
@@ -626,4 +738,4 @@ const mcp = {
   }
 };
 
-module.exports = { projects, chats, messages, documents, skills, credentials, providers, mcp, settings, agents, metrics, tags, slugify };
+module.exports = { projects, chats, messages, documents, skills, credentials, providers, guards, mcp, settings, agents, metrics, tags, slugify };

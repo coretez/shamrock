@@ -1,5 +1,7 @@
 'use strict';
 
+require('./_app-identity'); // keychain identity — see the file for why
+
 // Headless smoke test of the data layer. Runs inside Electron's main process
 // (so node:sqlite + safeStorage are available). Uses a throwaway temp DB.
 
@@ -12,6 +14,7 @@ const { openDatabase } = require('../src/main/db');
 const repo = require('../src/main/db/repo');
 const secrets = require('../src/main/secrets');
 const { registryList, getConnector } = require('../src/main/providers');
+const { testGuard } = require('../src/main/guards');
 const { connectAndList, McpConnection } = require('../src/main/mcp/client');
 const mcpManager = require('../src/main/mcp/manager');
 const { runChatLoop } = require('../src/main/chat-loop');
@@ -56,7 +59,22 @@ app.whenReady().then(async () => {
   assert(repo.documents.listByProject(projB.id).length === 0, 'projB sees none of projA docs');
 
   // Generated-document placement + write + versioning + index
-  const { placementPath, writeDocument, resolveOutputDir } = require('../src/main/documents');
+  const { placementPath, writeDocument, resolveOutputDir, mimeForPath } = require('../src/main/documents');
+
+  // How a document is READ is decided by the path, not by a label nobody
+  // validated. Uploads were indexed with a hardcoded mime whatever they were —
+  // older rows say "text", newer ones "text/plain" — so an uploaded .html
+  // opened as SOURCE instead of rendering in the artifact view.
+  assert(mimeForPath('Shamrock Landing.dc.html', 'text') === 'text/html', 'a non-mime label ("text") loses to the extension');
+  assert(mimeForPath('Shamrock Landing v2.dc.html', 'text/plain') === 'text/html', 'a GENERIC stored mime loses to a specific extension');
+  assert(mimeForPath('a.dc.html', null) === 'text/html', 'a compound extension still resolves on its last segment');
+  assert(mimeForPath('report.html', 'text/html') === 'text/html', 'a correct stored mime is preserved');
+  assert(mimeForPath('sheet.xlsx', 'application/octet-stream') === 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', 'octet-stream loses to a known extension');
+  assert(mimeForPath('scan.pdf', 'application/pdf') === 'application/pdf', 'PDF detection is unchanged — the viewer still routes it to its own window');
+  assert(mimeForPath('notes.md', null) === 'text/markdown' && mimeForPath('x.txt', 'text/plain') === 'text/plain', 'markdown and plain text are unaffected');
+  assert(mimeForPath('weird.xyz', 'text') === 'text/plain', 'an unknown extension falls back to text/plain, never to undefined');
+  assert(mimeForPath('report.csv', 'text/csv') === 'text/csv', 'a SPECIFIC stored mime is never overridden');
+
   assert(
     placementPath('documents/{type}/{tenant}/{title}-{period}.{ext}', { type: 'monthly-report', title: 'Expo Review', properties: { tenant: 'expo', period: '2026-08' }, format: 'html' }) === 'documents/monthly-report/expo/expo-review-2026-08.html',
     'placement template fills type/tenant/title/period/ext'
@@ -114,6 +132,121 @@ app.whenReady().then(async () => {
   const an = getConnector({ type: 'anthropic' }, 'k');
   assert(typeof oc.chat === 'function' && typeof oc.listModels === 'function', 'openai-compat connector built for qwen');
   assert(typeof an.chat === 'function' && typeof an.listModels === 'function', 'anthropic connector built');
+
+  // LLM guards: encrypted auth, one active route, metadata-only audit.
+  const guardOne = repo.guards.add({ kind: 'openai_proxy', label: 'Bearer Guard', baseUrl: 'https://guard.example/v1', authMode: 'bearer', secret: 'guard-SECRET', enabled: true });
+  const guardListed = repo.guards.list().find((g) => g.id === guardOne.id);
+  assert(guardListed.has_secret && !('secret' in guardListed) && !('secret_ciphertext' in guardListed), 'guard listing exposes only a has-secret flag');
+  assert(repo.guards.reveal(guardOne.id) === 'guard-SECRET', 'guard bearer token round-trips through secure storage');
+  const guardTwo = repo.guards.add({ kind: 'trylon', label: 'Local Trylon', baseUrl: 'http://127.0.0.1:8000/v1', enabled: true });
+  assert(repo.guards.active().id === guardTwo.id && !repo.guards.get(guardOne.id).enabled, 'enabling a guard turns the previous guard off');
+  repo.guards.recordEvent({ guardId: guardTwo.id, providerId: prov.id, chatId: chat.id, turnId: 'guard-smoke', model: 'gpt-4o', decision: 'blocked', durationMs: 12, detail: 'safety_code=10' });
+  const guardEvent = repo.guards.events(1)[0];
+  assert(guardEvent.decision === 'blocked' && guardEvent.detail === 'safety_code=10' && !('prompt' in guardEvent) && !('response' in guardEvent), 'guard audit stores decision metadata without prompt/response bodies');
+  repo.guards.update(guardTwo.id, { enabled: false });
+
+  // Guard connector routing: Trylon uses a non-streaming OpenAI request, but
+  // Shamrock still receives the completed guarded text as a final delta.
+  {
+    const http = require('node:http');
+    let seen = null;
+    const gateway = http.createServer((req, res) => {
+      if (req.method === 'GET' && req.url === '/health') {
+        res.writeHead(200, { 'Content-Type': 'application/json' }); res.end('{"status":"ok"}'); return;
+      }
+      let body = '';
+      req.on('data', (chunk) => { body += chunk; });
+      req.on('end', () => {
+        seen = { url: req.url, auth: req.headers.authorization, xApiKey: req.headers['x-api-key'], body: JSON.parse(body) };
+        res.writeHead(200, {
+          'Content-Type': 'application/json',
+          'X-Trylon-Blocked': 'true',
+          'X-Trylon-Safety-Code': '10',
+          'X-Trylon-Action': '0',
+          'X-Trylon-Message': 'PII blocked',
+          'X-Request-Id': 'guard-request-1'
+        });
+        if (req.url === '/anthropic/v1/messages') {
+          res.end(JSON.stringify({ type: 'error', error: { type: 'invalid_request_error', message: 'PII blocked' } }));
+        } else {
+          res.end(JSON.stringify({
+            id: 'trylon-blocked-smoke',
+            choices: [{ message: { role: 'assistant', content: 'PII blocked' }, finish_reason: 'content_filter' }],
+            usage: { prompt_tokens: 1, completion_tokens: 1 }
+          }));
+        }
+      });
+    });
+    await new Promise((resolve) => gateway.listen(0, '127.0.0.1', resolve));
+    const base = `http://127.0.0.1:${gateway.address().port}/v1`;
+    const audit = []; const deltas = [];
+    const guarded = getConnector({ type: 'openai' }, 'provider-key', {
+      guard: { enabled: true, kind: 'trylon', base_url: base, auth_mode: 'passthrough' },
+      onAudit: (event) => audit.push(event)
+    });
+    const guardedResult = await guarded.chat({ model: 'gpt-test', messages: [{ role: 'user', content: 'test@example.com' }], onDelta: (d) => deltas.push(d.text) });
+    assert(seen.url === '/v1/chat/completions' && seen.auth === 'Bearer provider-key', 'guard route receives the provider request and passthrough credential');
+    assert(!seen.body.stream && guardedResult.finishReason === 'content_filter' && guardedResult.text === 'PII blocked' && deltas.length === 0, 'Trylon adapter uses supported non-streaming mode and withholds blocked text from the normal token stream');
+    assert(audit.length === 1 && audit[0].decision === 'blocked' && /safety_code=10/.test(audit[0].detail) && /request_id=guard-request-1/.test(audit[0].detail), 'guard route records the block code and correlation id');
+    assert(guardedResult.security && guardedResult.security.direction === 'outbound' && guardedResult.security.stage === 'llm_firewall' && guardedResult.security.auditId === 1, 'Trylon input block becomes a structured outbound firewall event linked to its audit row');
+    const claudeAudit = []; const claudeDeltas = [];
+    const guardedClaude = getConnector({ type: 'anthropic' }, 'claude-provider-key', {
+      guard: { enabled: true, kind: 'trylon', base_url: base, auth_mode: 'passthrough' },
+      onAudit: (event) => claudeAudit.push(event)
+    });
+    const claudeResult = await guardedClaude.chat({ model: 'claude-test', messages: [{ role: 'user', content: 'test@example.com' }], onDelta: (d) => claudeDeltas.push(d.text) });
+    assert(seen.url === '/anthropic/v1/messages' && seen.xApiKey === 'claude-provider-key', 'Trylon routes Claude through its native Anthropic proxy path and passthrough credential');
+    assert(claudeResult.finishReason === 'content_filter' && claudeResult.text === 'PII blocked' && claudeDeltas.length === 0 && claudeAudit[0].decision === 'blocked', 'Trylon adapter returns and audits a guarded Claude block without streaming it as an assistant answer');
+    // A guard is a wire-protocol adapter: every OpenAI-compatible connection
+    // routes through Trylon's /v1 endpoint, whatever the vendor.
+    const guardedQwen = getConnector({ type: 'qwen' }, 'k', { guard: { enabled: true, kind: 'trylon', base_url: base, auth_mode: 'passthrough' } });
+    assert(guardedQwen && typeof guardedQwen.chat === 'function', 'Trylon routes every OpenAI-compatible connection, not just the OpenAI vendor');
+    let unsupported = null;
+    try { getConnector({ type: 'mystery' }, 'k', { guard: { enabled: true, kind: 'trylon', base_url: base, auth_mode: 'passthrough' } }); } catch (error) { unsupported = error; }
+    assert(unsupported, 'a guard fails closed for a protocol it has no adapter for');
+    // Direction is read off Trylon's response id, and it has to work for every
+    // OpenAI-compatible vendor — keyed on `type` it silently degraded to
+    // direction=unknown / stage=guard for Kimi, Qwen and Gemini, which is the
+    // difference between "your prompt never left the machine" and a shrug.
+    const kimiGuarded = getConnector({ type: 'kimi' }, 'k', {
+      guard: { enabled: true, kind: 'trylon', base_url: base, auth_mode: 'passthrough' },
+      onAudit: () => 7
+    });
+    const kimiBlocked = await kimiGuarded.chat({ model: 'kimi-test', messages: [{ role: 'user', content: 'test@example.com' }] });
+    assert(kimiBlocked.security && kimiBlocked.security.direction === 'outbound' && kimiBlocked.security.stage === 'llm_firewall', 'guard direction is classified for every OpenAI-compatible vendor, not only the OpenAI connection');
+    const health = await testGuard({ baseUrl: base });
+    assert(health.ok && health.detail === 'ok', 'guard connection test discovers Trylon health beneath a /v1 base URL');
+    await new Promise((resolve) => gateway.close(resolve));
+  }
+
+  // The gateway STATES which side it refused (X-Trylon-Stage) instead of
+  // leaving the client to infer it. The response-id trick only works on the
+  // OpenAI route; on the Claude route an input and an output block are
+  // byte-identical, which is what left direction=unknown there.
+  {
+    const http = require('node:http');
+    const stageGateway = http.createServer((req, res) => {
+      req.on('data', () => {});
+      req.on('end', () => {
+        res.writeHead(200, {
+          'Content-Type': 'application/json',
+          'X-Trylon-Blocked': 'true', 'X-Trylon-Safety-Code': '60',
+          'X-Trylon-Action': '0', 'X-Trylon-Message': 'toxic output',
+          'X-Trylon-Stage': 'output'
+        });
+        if (req.url === '/anthropic/v1/messages') res.end(JSON.stringify({ type: 'error', error: { type: 'invalid_request_error', message: 'toxic output' } }));
+        else res.end(JSON.stringify({ id: 'chatcmpl-real-upstream-id', choices: [{ message: { role: 'assistant', content: 'toxic output' }, finish_reason: 'content_filter' }] }));
+      });
+    });
+    await new Promise((resolve) => stageGateway.listen(0, '127.0.0.1', resolve));
+    const stageBase = `http://127.0.0.1:${stageGateway.address().port}/v1`;
+    const stageGuard = { enabled: true, kind: 'trylon', base_url: stageBase, auth_mode: 'passthrough' };
+    const oaOut = await getConnector({ type: 'openai' }, 'k', { guard: stageGuard, onAudit: () => 1 }).chat({ model: 'm', messages: [{ role: 'user', content: 'x' }] });
+    assert(oaOut.security.direction === 'inbound' && oaOut.security.stage === 'gate_guard', 'an OUTPUT block is reported as inbound at the gate guard');
+    const clOut = await getConnector({ type: 'anthropic' }, 'k', { guard: stageGuard, onAudit: () => 1 }).chat({ model: 'm', messages: [{ role: 'user', content: 'x' }] });
+    assert(clOut.security.direction === 'inbound' && clOut.security.stage === 'gate_guard', 'the Claude route gets a real direction from the header, where the body carries no clue');
+    await new Promise((resolve) => stageGateway.close(resolve));
+  }
 
   // ── Stream honesty: fake SSE server — error frames, truncation, retry ──
   {
@@ -208,6 +341,27 @@ app.whenReady().then(async () => {
     });
     assert(loopRes.truncated === true && truncEvents.length === 1, 'chat-loop: truncation reaches the caller and the glass box');
 
+    // 8. A turn that dies mid-loop carries its ledger out on the error. An
+    // LLM-firewall block on iteration 4 used to report toolTrace:[] and
+    // iterations:0 — indistinguishable from a block on the first call, and it
+    // threw away three tool results the user had already paid for.
+    let midLoopCalls = 0;
+    let midLoopErr = null;
+    try {
+      await runChatLoop({
+        chat: async () => {
+          midLoopCalls += 1;
+          if (midLoopCalls > 3) { const e = new Error('blocked'); e.code = 'LLM_GUARD_BLOCKED'; throw e; }
+          return { text: '', toolCalls: [{ id: `c${midLoopCalls}`, name: 'probe', args: {} }] };
+        },
+        callTool: async () => ({ text: 'result', isError: false }),
+        model: 'm', messages: [{ role: 'user', content: 'q' }],
+        tools: [{ name: 'probe', description: 'p', inputSchema: { type: 'object' } }]
+      });
+    } catch (e) { midLoopErr = e; }
+    assert(midLoopErr && midLoopErr.partial && midLoopErr.partial.iterations === 4 && midLoopErr.partial.toolTrace.length === 3,
+      'chat-loop: a mid-loop failure carries the work already done out with the error');
+
     sse.close();
   }
 
@@ -231,6 +385,22 @@ app.whenReady().then(async () => {
   const called = await mcpManager.callTool(echoName, { text: 'hi' }, ts.routes);
   assert(called.text === 'echo: hi', 'manager.callTool executed the tool over a live connection');
   mcpManager.disposeAll();
+
+  // OAuth refresh-token rotation: a SPENT refresh token must never be presented
+  // twice. Servers that rotate (OAuth 2.1 / RFC 6819 §5.2.2.3) read a second
+  // presentation as proof the token was stolen and revoke the whole grant — so
+  // the retry is not a harmless retry, it is what destroys the authorization.
+  {
+    const { isDeadGrant } = require('../src/main/mcp/oauth');
+    const replay = new Error('HTTP 400: refresh_token replay detected'); replay.oauthError = 'invalid_grant';
+    assert(isDeadGrant(replay), 'a replay-detected refresh is recognised as a DEAD grant');
+    const coded = new Error('HTTP 400'); coded.oauthError = 'invalid_grant';
+    assert(isDeadGrant(coded), 'invalid_grant alone is enough — the prose is not required');
+    const flaky = new Error('HTTP 503: upstream temporarily unavailable');
+    assert(!isDeadGrant(flaky), 'a transient 5xx is NOT a dead grant — it stays retryable');
+    const offline = new Error('fetch failed');
+    assert(!isDeadGrant(offline), 'a network failure is NOT a dead grant');
+  }
 
   // Chat loop: fake connector requests a tool, then answers using the result
   let step = 0;
@@ -406,6 +576,28 @@ app.whenReady().then(async () => {
   // "[0m" without the ESC byte is NOT touched (the regex must anchor on \x1b).
   const fAnsi = filterToolResult('sh', '\x1b[31mred\x1b[0m arr[m] keeps [0m literal');
   assert(fAnsi.text === 'red arr[m] keeps [0m literal', 'filter strips ANSI codes without corrupting bracket text');
+  // Epoch-millis → ISO. A 13-digit epoch has ~1-in-10 odds of passing Luhn, so
+  // raw Fluency case timestamps read as CREDIT_CARD at confidence 1.0 and the
+  // LLM firewall blocked real investigations. Converting at the tool boundary
+  // fixes that AND gives the model a date it can actually reason about.
+  const fEpochNum = filterToolResult('list_cases', '{"id":"c1","first":1785304080000}');
+  assert(fEpochNum.rules.includes('epoch-iso') && JSON.parse(fEpochNum.text).first === '2026-07-29T05:48:00.000Z',
+    'filter converts epoch-millis in JSON to an ISO STRING, keeping the JSON parseable');
+  const fEpochStr = filterToolResult('list_cases', '{"ts":"1785304080000"}');
+  assert(JSON.parse(fEpochStr.text).ts === '2026-07-29T05:48:00.000Z', 'filter converts epoch-millis held as a JSON string');
+  // MCP servers hand back CSV/log blobs as ONE JSON string field. Matching a
+  // string only when it is ENTIRELY a timestamp walks past every epoch inside
+  // such a blob — which is how a real Expo report still tripped the card rule.
+  const fEpochBlob = filterToolResult('list_cases', JSON.stringify({ rows: 'AgentID,new,6,1786307640000,1786309251000\nOther,1,2' }));
+  assert(fEpochBlob.rules.includes('epoch-iso') && JSON.parse(fEpochBlob.text).rows.includes('2026-08-09T20:34:00.000Z') && !JSON.parse(fEpochBlob.text).rows.includes('1786307640000'),
+    'filter converts epoch-millis embedded in a CSV blob carried inside a JSON string');
+  const fEpochProse = filterToolResult('notes', 'First seen at 1785304080000 on DC01');
+  assert(fEpochProse.text === 'First seen at 2026-07-29T05:48:00.000Z on DC01', 'filter converts epoch-millis in free text');
+  const fCard = filterToolResult('notes', 'Card 4111111111111111 and 4111111111111 on file');
+  assert(fCard.text.includes('4111111111111111') && fCard.text.includes('4111111111111') && !fCard.rules.includes('epoch-iso'),
+    'filter NEVER rewrites card numbers as timestamps — the epoch window cannot reach them');
+  const fNotEpoch = filterToolResult('notes', 'event id 100234567890 and value 9999999999999');
+  assert(!fNotEpoch.rules.includes('epoch-iso'), 'filter leaves out-of-window digit strings alone');
   // Chat loop applies the filter to tool results
   let cstep = 0;
   const bigJson = JSON.stringify({ items: Array(400).fill({ a: 1, b: 2 }) }, null, 2);
@@ -659,6 +851,33 @@ app.whenReady().then(async () => {
     assert(replanCalls === 3, 'stuck step auto-re-planned exactly REPLAN_BUDGET (3) times');
     assert(escalation && escalation.goal === 'dig everything' && escalation.replans === 3, 'escalation carries the goal + re-plan count for the user');
     assert(out.stepResults.length === 1 && out.stepResults[0].incomplete, 'declined escalation keeps the partial for synthesis');
+
+    // A step that DIES (an LLM-firewall block, most often) kills the turn — but
+    // the steps before it finished, and their tool results are evidence the
+    // user already paid for. Both executeStep and executePlan carry the ledger
+    // out on `e.partial`; the flat loop already did, so a planned turn used to
+    // be the one path that silently threw the whole thing away.
+    {
+      let modelCalls = 0;
+      const dyingChat = async ({ tools }) => {
+        modelCalls += 1;
+        if (modelCalls > 3) { const e = new Error('blocked'); e.code = 'LLM_GUARD_BLOCKED'; throw e; }
+        if (!tools || !tools.length) return { text: 'done', toolCalls: [], usage: { calls: 1, inputTokens: 10, outputTokens: 2, cachedTokens: 0, cacheCreationTokens: 0, measured: true } };
+        return { text: '', toolCalls: [{ id: `t${modelCalls}`, name: 'search', args: {} }], usage: { calls: 1, inputTokens: 10, outputTokens: 2, cachedTokens: 0, cacheCreationTokens: 0, measured: true } };
+      };
+      let died = null;
+      try {
+        await executePlan({
+          chat: dyingChat, callTool: async () => ({ text: 'result', isError: false }), model: 'mock',
+          plan: { goal: 'two steps', steps: [{ id: 1, task: 'first' }, { id: 2, task: 'second' }] },
+          tools: [{ name: 'search', description: '', inputSchema: {} }],
+          store: new VariableStore(), stepBudget: 4
+        });
+      } catch (e) { died = e; }
+      assert(died && died.code === 'LLM_GUARD_BLOCKED', 'a guard block during a planned turn still kills the turn');
+      assert(died.partial && died.partial.toolTrace.length > 0, 'a planned turn carries the tool work it had already done out with the error');
+      assert(died.partial.usage && died.partial.usage.inputTokens > 0, 'and carries the tokens the turn actually spent, not just the blocked call');
+    }
 
     // A useful re-plan (tail replaced with a completable step) needs no escalation.
     const healChat = async ({ messages, tools }) => {
@@ -1902,6 +2121,45 @@ app.whenReady().then(async () => {
     assert(!asked, 'O26: the guard is scoped — ordinary settings never prompt');
     dialog.showMessageBox = realDialog;
     repo.projects.archive(gp.id);
+  }
+
+  // ── Archive / restore / delete ────────────────────────────────────────────
+  // Archiving is reversible and touches nothing else; deleting is permanent
+  // and cascades. The two must never be confusable, in the data layer or the
+  // UI — a control once labelled "Delete" quietly archived instead.
+  {
+    console.log('\n[archive] reversible hiding vs permanent deletion');
+    const ap = repo.projects.create({ name: 'Archive Suite' });
+    const keep = repo.projects.create({ name: 'Untouched' });
+    const ac = repo.chats.create({ projectId: ap.id, title: 'session' });
+    repo.messages.add({ chatId: ac.id, role: 'user', content: 'hello' });
+    const ad = repo.documents.create({ projectId: ap.id, title: 'Deliverable', path: path.join(tmp, 'd.html'), source: 'chat' });
+
+    repo.chats.archive(ac.id);
+    assert(repo.chats.listByProject(ap.id).length === 0, 'archive: the chat leaves the active list');
+    assert(repo.chats.listArchived(ap.id).length === 1, 'archive: and is findable in the archive');
+    repo.chats.unarchive(ac.id);
+    assert(repo.chats.listByProject(ap.id).length === 1, 'archive: restore brings the chat back');
+    assert(repo.chats.get(ac.id).archived_at === null, 'archive: restore clears archived_at');
+    assert(repo.messages.listByChat(ac.id).length === 1, 'archive: a round trip preserves the messages');
+
+    repo.projects.archive(ap.id);
+    assert(!repo.projects.list().some((p) => p.id === ap.id), 'archive: the project leaves the active list');
+    assert(repo.projects.listArchived().some((p) => p.id === ap.id), 'archive: and is findable in the archive');
+    assert(repo.chats.listByProject(ap.id).length === 1, 'archive: archiving a project does NOT archive its chats');
+    repo.projects.unarchive(ap.id);
+    assert(repo.projects.list().some((p) => p.id === ap.id), 'archive: restore brings the project back');
+
+    const c = repo.projects.contents(ap.id);
+    assert(c.chats === 1 && c.documents === 1 && c.messages === 1, 'delete: contents() counts what the cascade will take');
+    assert(c.filesOnDisk === 1, 'delete: files on disk are counted separately from library rows');
+    repo.chats.remove(ac.id);
+    assert(!repo.chats.get(ac.id) && repo.messages.listByChat(ac.id).length === 0, 'delete: a chat takes its messages with it');
+    assert(!!repo.documents.get(ad.id), 'delete: project documents SURVIVE a chat delete');
+    repo.projects.remove(ap.id);
+    assert(!repo.projects.get(ap.id) && !repo.documents.get(ad.id), 'delete: a project cascades to its documents');
+    assert(!!repo.projects.get(keep.id), 'delete: neighbouring projects are untouched');
+    repo.projects.archive(keep.id);
   }
 
   console.log('\nALL SMOKE TESTS PASSED');

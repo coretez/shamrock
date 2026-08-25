@@ -64,6 +64,12 @@ async function runChatLoop({ chat, callTool, model, messages, tools = [], maxIte
       // The abort signal kills the in-flight HTTP call — surface that as a
       // clean stop, not an error.
       if (stopped()) { emit({ type: 'done' }); return { reply: '', toolTrace, iterations: i, usage, aborted: true }; }
+      // A turn that dies mid-loop has usually already DONE work — six tool
+      // calls, real tokens spent. Throwing a bare error discards all of it, so
+      // an LLM-firewall block on iteration 7 looked identical to one on
+      // iteration 1. Carry the ledger out with the error; the caller decides
+      // whether to keep it.
+      e.partial = { toolTrace, iterations: i, usage };
       throw e;
     }
     addUsage(res.usage);

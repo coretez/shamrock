@@ -167,6 +167,10 @@ async function executeStep({ chat, callTool, model, step, tools = [], history = 
           partial: '', history: h, stuck: true, reason: 'provider-timeout', usage, toolTrace
         };
       }
+      // Anything else DOES kill the turn (an LLM-firewall block, most often).
+      // Carry this step's ledger out with it so the work is not silently lost
+      // on the way up — executePlan folds in the steps that already finished.
+      e.partial = { toolTrace: [...toolTrace], iterations: i, usage };
       throw e;
     }
     addUsage(usage, res.usage);
@@ -359,7 +363,23 @@ async function executePlan({ chat, callTool, model, plan, tools = [], store, his
       idx += 1; continue;
     }
 
-    const r = await executeStep({ chat, callTool, model, step, tools, history: h, store, budget: stepBudget, onEvent: emit, isAborted, compact });
+    let r;
+    try {
+      r = await executeStep({ chat, callTool, model, step, tools, history: h, store, budget: stepBudget, onEvent: emit, isAborted, compact });
+    } catch (e) {
+      // A step that dies (an LLM-firewall block, most often) kills the turn —
+      // but the steps BEFORE it finished, and their tool results are the
+      // evidence the user already paid for. Fold the completed work together
+      // with the dying step's own ledger and carry it up; ipc.js reads
+      // `e.partial` and keeps it on the blocked result.
+      mergeUsage((e.partial && e.partial.usage) || null);
+      e.partial = {
+        toolTrace: [...toolTrace, ...((e.partial && e.partial.toolTrace) || [])],
+        iterations: stepResults.length,
+        usage
+      };
+      throw e;
+    }
     h = r.history;
     truncated = truncated || !!r.truncated;
     mergeUsage(r.usage);

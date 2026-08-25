@@ -5,7 +5,7 @@ const path = require('node:path');
 const fs = require('node:fs');
 
 // Bump this and add a migration block below when the schema changes.
-const SCHEMA_VERSION = 20;
+const SCHEMA_VERSION = 21;
 
 let db = null;
 
@@ -280,6 +280,32 @@ function migrate(database) {
     `);
     const ccols = database.prepare('PRAGMA table_info(chats)').all().map((c) => c.name);
     if (!ccols.includes('summary')) database.exec('ALTER TABLE chats ADD COLUMN summary TEXT');
+  }
+
+  // v21: app-global downstream LLM firewall connections plus a metadata-only
+  // audit trail. Raw prompts/responses are intentionally never stored here.
+  if (current < 21) {
+    database.exec(`
+      CREATE TABLE IF NOT EXISTS llm_guards (
+        id INTEGER PRIMARY KEY, kind TEXT NOT NULL DEFAULT 'openai_proxy', label TEXT,
+        base_url TEXT NOT NULL, auth_mode TEXT NOT NULL DEFAULT 'passthrough',
+        secret_ciphertext BLOB, enabled INTEGER NOT NULL DEFAULT 0,
+        status TEXT, status_detail TEXT, last_checked_at TEXT,
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      CREATE TABLE IF NOT EXISTS llm_guard_events (
+        id INTEGER PRIMARY KEY,
+        guard_id INTEGER REFERENCES llm_guards(id) ON DELETE SET NULL,
+        provider_id INTEGER REFERENCES providers(id) ON DELETE SET NULL,
+        chat_id INTEGER REFERENCES chats(id) ON DELETE SET NULL,
+        turn_id TEXT, model TEXT, operation TEXT NOT NULL DEFAULT 'chat',
+        decision TEXT NOT NULL, duration_ms INTEGER, detail TEXT,
+        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      CREATE INDEX IF NOT EXISTS idx_guard_events_created ON llm_guard_events(id DESC);
+      CREATE INDEX IF NOT EXISTS idx_guard_events_chat ON llm_guard_events(chat_id, id DESC);
+    `);
   }
 
   // Future migrations go here as `if (current < N) { ... }` blocks.

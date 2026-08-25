@@ -44,7 +44,10 @@
     <div class="body">
       <aside class="sidebar">
         <div class="pane__head">
-          <span>PROJECTS</span>
+          <span id="projects-head">PROJECTS</span>
+          <!-- Archive is a place, not a disappearance: the toggle lives on the
+               list the items left, which is where you look for them. -->
+          <button class="archive-btn" id="projects-archive-btn" type="button" title="Show archived projects">ARCHIVE</button>
           <button class="icon-btn" id="new-project-btn" type="button" title="New project (⌘N)">+</button>
         </div>
         <form class="inline-form" id="new-project-form" hidden>
@@ -53,7 +56,8 @@
         <ul class="list" id="project-list"></ul>
 
         <div class="pane__head pane__head--mt">
-          <span>CHATS</span>
+          <span id="chats-head">CHATS</span>
+          <button class="archive-btn" id="chats-archive-btn" type="button" title="Show archived chats">ARCHIVE</button>
           <button class="icon-btn" id="new-chat-btn" type="button" title="New chat" disabled>+</button>
         </div>
         <ul class="list list--grow" id="chat-list"></ul>
@@ -66,6 +70,7 @@
           <button class="tab" data-page="documents" type="button">DOCUMENTS</button>
           <button class="tab" data-page="skills" type="button">SKILLS</button>
           <button class="tab" data-page="agents" type="button">AGENTS</button>
+          <button class="tab" data-page="guards" type="button">GUARDS</button>
           <button class="tab" data-page="internals" type="button">INTERNALS</button>
           <div class="spacer"></div>
           <div class="tabbar__note" id="toolbar-note"></div>
@@ -399,20 +404,39 @@
                 <button class="btn btn--ghost btn--sm" id="docs-tidy" type="button" title="Librarian pass: tag untagged documents and summarize unfiled sessions — tags only, nothing moves on disk">✦ TIDY LIBRARY</button>
                 <button class="btn btn--ghost btn--sm" id="docs-reveal" type="button">⤴ OPEN FOLDER</button>
               </div>
-              <div class="docsec">PROJECT DOCUMENTATION</div>
-              <ul class="connlist" id="docs-canonical"></ul>
-              <div class="docsec docsec--row">GENERATED &amp; UPLOADED
-                <span class="spacer"></span>
-                <span class="libview" id="library-view">
-                  <button class="libview__btn libview__btn--on" data-view="recency" type="button">RECENCY</button>
-                  <button class="libview__btn" data-view="kind" type="button">KIND</button>
-                  <button class="libview__btn" data-view="entity" type="button">ENTITY</button>
-                  <button class="libview__btn" data-view="topic" type="button">TOPIC</button>
-                </span>
+              <!-- Two different libraries with two different jobs: the docs the
+                   planner reads, and the things this project produced. Shown one
+                   at a time — nobody needs both in view at once. -->
+              <div class="doctabs" id="doc-tabs">
+                <button class="doctab doctab--on" data-doctab="canonical" type="button">PROJECT DOCUMENTATION<span class="doctab__n" id="doctab-n-canonical"></span></button>
+                <button class="doctab" data-doctab="library" type="button">GENERATED &amp; UPLOADED<span class="doctab__n" id="doctab-n-library"></span></button>
               </div>
-              <div class="libfilter" id="library-filter" hidden></div>
-              <ul class="connlist" id="docs-other"></ul>
-              <div class="mscreen__empty" id="docs-other-empty" hidden>Nothing yet — generated reports, exports, and uploads land here.</div>
+
+              <div class="docpane" data-doctab="canonical">
+                <ul class="connlist" id="docs-canonical"></ul>
+              </div>
+
+              <div class="docpane" data-doctab="library" hidden>
+                <div class="docsec docsec--row">
+                  <span class="spacer"></span>
+                  <span class="libview" id="library-view">
+                    <button class="libview__btn libview__btn--on" data-view="recency" type="button">RECENCY</button>
+                    <button class="libview__btn" data-view="kind" type="button">KIND</button>
+                    <button class="libview__btn" data-view="entity" type="button">ENTITY</button>
+                    <button class="libview__btn" data-view="topic" type="button">TOPIC</button>
+                  </span>
+                </div>
+                <div class="libfilter" id="library-filter" hidden></div>
+                <!-- Faceted browse: rail of combinable dimensions + the result list. -->
+                <div class="libgrid">
+                  <aside class="libfacets" id="library-facets"></aside>
+                  <div class="liblist">
+                    <div class="libchips" id="library-chips" hidden></div>
+                    <ul class="connlist" id="docs-other"></ul>
+                    <div class="mscreen__empty" id="docs-other-empty" hidden>Nothing yet — generated reports, exports, and uploads land here.</div>
+                  </div>
+                </div>
+              </div>
               <div class="docreader" id="doc-reader" hidden>
                 <div class="docreader__bar"><span class="docreader__title" id="doc-reader-title"></span><span class="spacer"></span><button class="btn btn--ghost btn--sm" id="doc-reader-close" type="button">CLOSE</button></div>
                 <div class="docreader__body" id="doc-reader-body"></div>
@@ -475,6 +499,53 @@
                 <div class="field"><label>Model <span class="opt">optional — defaults to the chat model</span></label><input id="a-model" placeholder="leave blank to inherit the chat model" /></div>
                 <div class="field"><label>Allowed tools <span class="opt">optional — comma-separated tool names; blank = all</span></label><input id="a-tools" placeholder="e.g. fluency__run_report, fluency__list_cases" /></div>
                 <div class="editor__actions"><div class="spacer"></div><button class="btn btn--ghost btn--sm" id="agent-cancel" type="button">CANCEL</button><button class="btn btn--brand btn--sm" id="agent-save" type="button">SAVE</button></div>
+              </div>
+            </div>
+          </section>
+
+          <!-- LLM firewall guards (app-global) -->
+          <section class="page page--scroll" data-page="guards" hidden>
+            <div class="mscreen">
+              <div class="mscreen__head">
+                <div>
+                  <div class="mscreen__title">LLM FIREWALL GUARDS</div>
+                  <div class="mscreen__sub">Optionally route model calls through one trusted guard. Trylon supports Shamrock's OpenAI and Claude connections; unsupported providers fail closed. Audit records contain decisions and timing, never raw prompts or model-response bodies.</div>
+                </div>
+                <div class="spacer"></div>
+                <button class="btn btn--brand btn--sm" id="guard-add" type="button">+ ADD GUARD</button>
+              </div>
+
+              <ul class="connlist" id="guard-list"></ul>
+              <div class="mscreen__empty" id="guard-empty" hidden>No guards configured. Add the local Trylon endpoint to begin.</div>
+
+              <div class="editor" id="guard-editor" hidden>
+                <div class="editor__title" id="guard-editor-title">ADD GUARD</div>
+                <div class="field"><label>Name</label><input id="g-label" placeholder="e.g. Local Trylon" /></div>
+                <div class="field">
+                  <label>Guard type</label>
+                  <select id="g-kind"><option value="trylon">Trylon Gateway</option><option value="openai_proxy">Generic OpenAI-compatible proxy</option></select>
+                </div>
+                <div class="field"><label>OpenAI-compatible base URL</label><input id="g-baseurl" placeholder="http://127.0.0.1:8000/v1" /><div class="field__hint">Shamrock sends /chat/completions beneath this URL. Trylon's local default is http://127.0.0.1:8000/v1.</div></div>
+                <div class="field">
+                  <label>Authentication</label>
+                  <select id="g-auth"><option value="passthrough">Pass the provider API key through</option><option value="bearer">Use a separate guard bearer token</option></select>
+                  <div class="field__hint">Trylon requires passthrough. A generic OpenAI-compatible guard may instead use its own bearer token and upstream credentials.</div>
+                </div>
+                <div class="field" id="g-token-field" hidden><label>Guard bearer token</label><input id="g-token" type="password" placeholder="paste token" /><div class="field__hint" id="g-token-hint">Encrypted in the macOS Keychain and never shown again.</div></div>
+                <div class="editor__actions">
+                  <button class="btn btn--ghost btn--sm" id="guard-test" type="button">TEST CONNECTION</button>
+                  <span class="test-result" id="guard-result"></span>
+                  <div class="spacer"></div>
+                  <button class="btn btn--ghost btn--sm" id="guard-cancel" type="button">CANCEL</button>
+                  <button class="btn btn--brand btn--sm" id="guard-save" type="button">SAVE</button>
+                </div>
+              </div>
+
+              <div class="guard-audit">
+                <div class="guard-audit__head"><span>AUDIT ACTIVITY</span><span class="spacer"></span><button class="conn__btn" id="guard-refresh" type="button">REFRESH</button></div>
+                <div class="guard-stats" id="guard-stats"></div>
+                <ul class="guard-events" id="guard-events"></ul>
+                <div class="mscreen__empty" id="guard-events-empty" hidden>No guarded model calls recorded yet.</div>
               </div>
             </div>
           </section>

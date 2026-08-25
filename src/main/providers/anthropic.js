@@ -42,7 +42,20 @@ async function req(url, { key, method = 'GET', body, timeoutMs = 30000, signal }
       const detail = json?.error?.message || json?.message || (text ? text.slice(0, 400) : '');
       throw httpError(res.status, detail, res.headers.get('retry-after'));
     }
-    return json;
+    return {
+      json,
+      responseMeta: {
+        blocked: res.headers.get('x-trylon-blocked') === 'true',
+        // The gateway STATES which side it refused (X-Trylon-Stage). Inferring it
+        // from the response body only works on the OpenAI route and not at all on
+        // the Claude one, where input and output blocks are byte-identical.
+        stage: res.headers.get('x-trylon-stage'),
+        safetyCode: res.headers.get('x-trylon-safety-code'),
+        action: res.headers.get('x-trylon-action'),
+        message: res.headers.get('x-trylon-message'),
+        requestId: res.headers.get('x-request-id')
+      }
+    };
   } catch (err) {
     if (err.name === 'AbortError') {
       // The cause is known HERE — carry it as a code, not a sentence.
@@ -181,7 +194,7 @@ function anthropic({ baseUrl, key }) {
   const base = trimSlash(baseUrl);
   return {
     async listModels() {
-      const json = await req(`${base}/v1/models`, { key, timeoutMs: 15000 });
+      const { json } = await req(`${base}/v1/models`, { key, timeoutMs: 15000 });
       const data = Array.isArray(json?.data) ? json.data : [];
       return data.map((m) => m.id).filter(Boolean).sort();
     },
@@ -197,11 +210,12 @@ function anthropic({ baseUrl, key }) {
         if (forceTool && tools.length === 1) body.tool_choice = { type: 'tool', name: tools[0].name };
       }
       if (onDelta) return streamAnthropic(base, key, body, onDelta, signal, onRetry);
-      const json = await withRetry(() => req(`${base}/v1/messages`, { key, method: 'POST', body, timeoutMs: 300000, signal }), { retries: 3, signal, onRetry });
-      const content = Array.isArray(json?.content) ? json.content : [];
+      const { json, responseMeta } = await withRetry(() => req(`${base}/v1/messages`, { key, method: 'POST', body, timeoutMs: 300000, signal }), { retries: 3, signal, onRetry });
+      const blockedText = responseMeta.blocked ? (json?.error?.message || responseMeta.message || 'Blocked by the LLM guard') : '';
+      const content = Array.isArray(json?.content) ? json.content : (blockedText ? [{ type: 'text', text: blockedText }] : []);
       const text = content.filter((b) => b.type === 'text').map((b) => b.text).join('');
       const toolCalls = content.filter((b) => b.type === 'tool_use').map((b) => ({ id: b.id, name: b.name, args: b.input || {} }));
-      return { text, toolCalls, assistantRaw: content, raw: json, usage: normalizeUsage(json.usage), finishReason: json.stop_reason || null, truncated: json.stop_reason === 'max_tokens' };
+      return { text, toolCalls, assistantRaw: content, raw: json, usage: normalizeUsage(json.usage), finishReason: responseMeta.blocked ? 'content_filter' : (json.stop_reason || null), truncated: json.stop_reason === 'max_tokens', guardMeta: responseMeta };
     }
   };
 }

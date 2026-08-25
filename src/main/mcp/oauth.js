@@ -32,7 +32,15 @@ async function fetchJson(url, opts = {}) {
     });
     const text = await res.text();
     let j = null; try { j = JSON.parse(text); } catch {}
-    if (!res.ok) throw new Error(`HTTP ${res.status}${j && j.error ? ': ' + (j.error_description || j.error) : ''}`);
+    if (!res.ok) {
+      const err = new Error(`HTTP ${res.status}${j && j.error ? ': ' + (j.error_description || j.error) : ''}`);
+      // Keep the MACHINE-READABLE code. "invalid_grant" is the difference
+      // between "try again in a moment" and "this grant is gone forever", and
+      // that distinction cannot be recovered from the prose afterwards.
+      err.oauthError = (j && j.error) || null;
+      err.status = res.status;
+      throw err;
+    }
     return j;
   } finally { clearTimeout(t); }
 }
@@ -49,7 +57,15 @@ async function fetchForm(url, form, opts = {}) {
     });
     const text = await res.text();
     let j = null; try { j = JSON.parse(text); } catch {}
-    if (!res.ok) throw new Error(`HTTP ${res.status}${j && j.error ? ': ' + (j.error_description || j.error) : ''}`);
+    if (!res.ok) {
+      const err = new Error(`HTTP ${res.status}${j && j.error ? ': ' + (j.error_description || j.error) : ''}`);
+      // Keep the MACHINE-READABLE code. "invalid_grant" is the difference
+      // between "try again in a moment" and "this grant is gone forever", and
+      // that distinction cannot be recovered from the prose afterwards.
+      err.oauthError = (j && j.error) || null;
+      err.status = res.status;
+      throw err;
+    }
     return j;
   } finally { clearTimeout(t); }
 }
@@ -123,6 +139,20 @@ async function exchangeCode(tokenEndpoint, { code, redirectUri, clientId, client
   return r;
 }
 
+/**
+ * True when a refresh failure means the GRANT IS DEAD, not that the network
+ * hiccuped. Servers that rotate refresh tokens (OAuth 2.1 / RFC 6819 §5.2.2.3)
+ * treat a second presentation of a spent token as evidence of theft and revoke
+ * the whole token family — so retrying does not just fail, it is the thing that
+ * destroys the grant. `invalid_grant` is the standard code; the replay wording
+ * is matched too because not every server sets the code.
+ */
+function isDeadGrant(error) {
+  if (!error) return false;
+  if (error.oauthError === 'invalid_grant' || error.oauthError === 'invalid_request') return true;
+  return /replay detected|token (?:has been )?revoked|refresh token (?:is )?(?:invalid|expired)/i.test(error.message || '');
+}
+
 /** Refresh an access token. Returns the fields to merge into the stored token set. */
 async function refresh(oauth) {
   if (!oauth.refresh_token) throw new Error('no refresh token');
@@ -176,4 +206,5 @@ async function runAuthFlow(serverUrl, { openExternal }) {
   }
 }
 
-module.exports = { runAuthFlow, refresh, discover, buildPkce, startLoopback, base64url };
+module.exports = {
+  isDeadGrant, runAuthFlow, refresh, discover, buildPkce, startLoopback, base64url };
